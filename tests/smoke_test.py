@@ -232,6 +232,27 @@ async def main() -> None:
     await client2.close()
     await runner.cleanup()
 
+    # ---------- اختبار مخزون الحسابات الجاهزة (SEED + استهلاك + حفظ) ----------
+    from services.garena import SEED_GUEST_ACCOUNTS  # noqa: E402
+
+    db3 = Database(path="/tmp/stock_test3.db")
+    await db3.init()
+    # حقن المخزون: حساب واحد جاهز لمنطقة ME
+    avail = await db3.get_available_guest("ME", TARGET)
+    assert avail, "no seeded stock account for ME"
+    stock_uid, stock_hash = avail
+    assert stock_uid == SEED_GUEST_ACCOUNTS["ME"][0]["uid"]
+    assert stock_hash == SEED_GUEST_ACCOUNTS["ME"][0]["password_hash"]
+    # استهلاك الحساب لنفس الهدف → يجب ألا يعود متاحاً لنفس الهدف
+    await db3.mark_guest_used(stock_uid, TARGET, "ME")
+    assert await db3.get_available_guest("ME", TARGET) is None, "used account still available for same target"
+    # لكن يبقى متاحاً لهدف آخر
+    assert await db3.get_available_guest("ME", "999999999") is not None, "stock should stay for other targets"
+    # حفظ حساب جديد في المخزون → يصبح متاحاً
+    await db3.save_guest_account("999999", "ME", "HASHXYZ")
+    assert await db3.get_available_guest("ME", "999999999") is not None, "saved account not available"
+    print("✔ مخزون الحسابات الجاهزة (seed/استهلاك/حفظ) OK →", stock_uid)
+
     print("\n✅ ALL SMOKE TESTS PASSED — likes:", info["total_likes"])
 
 

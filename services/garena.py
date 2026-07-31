@@ -82,6 +82,26 @@ DEFAULT_SERVER = "https://clientbp.ggblueshark.com"
 # المناطق التي تدعم تسجيل الحسابات الضيفية (حسب أحدث عميل شغال)
 GUEST_REGIONS: List[str] = ["IND", "SG", "BR", "US", "RU", "TH", "VN", "TW", "ME", "CIS", "BD"]
 
+# ==========================================================================
+# مخزون الحسابات الجاهزة — تُستخدم عندما يرفض Garena تسجيل ضيف جديد من سيرفر
+# Railway (خطأ error_not_found 1005). كل منطقة لها حساب جاهز (uid + password_hash).
+# كل حساب يصلح لإعجاب واحد فقط لنفس الهدف (بعد الاستخدام يُعلَّم كمستخدم).
+# ==========================================================================
+SEED_GUEST_ACCOUNTS: Dict[str, List[Dict[str, str]]] = {
+    "IND": [{"uid": "4104125669", "password_hash": "E5655A0D14EF812A908726152BDD38021BEF528801AA42B16CFA4ED67141C4CA"}],
+    "SG": [{"uid": "3158350464", "password_hash": "70EA041FCF79190E3D0A8F3CA95CAAE1F39782696CE9D85C2CCD525E28D223FC"}],
+    "RU": [{"uid": "3301239795", "password_hash": "DD40EE772FCBD61409BB15033E3DE1B1C54EDA83B75DF0CDD24C34C7C8798475"}],
+    "ID": [{"uid": "3301269321", "password_hash": "D11732AC9BBED0DED65D0FED7728CA8DFF408E174202ECF1939E328EA3E94356"}],
+    "TW": [{"uid": "3301329477", "password_hash": "359FB179CD92C9C1A2A917293666B96972EF8A5FC43B5D9D61A2434DD3D7D0BC"}],
+    "US": [{"uid": "3301387397", "password_hash": "BAC03CCF677F8772473A09870B6228ADFBC1F503BF59C8D05746DE451AD67128"}],
+    "VN": [{"uid": "3301447047", "password_hash": "044714F5B9284F3661FB09E4E9833327488B45255EC9E0CCD953050E3DEF1F54"}],
+    "TH": [{"uid": "3301470613", "password_hash": "39EFD9979BD6E9CCF6CBFF09F224C4B663E88B7093657CB3D4A6F3615DDE057A"}],
+    "ME": [{"uid": "3301535568", "password_hash": "BEC9F99733AC7B1FB139DB3803F90A7E78757B0BE395E0A6FE3A520AF77E0517"}],
+    "PK": [{"uid": "3301828218", "password_hash": "3A0E972E57E9EDC39DC4830E3D486DBFB5DA7C52A4E8B0B8F3F9DC4450899571"}],
+    "CIS": [{"uid": "3309128798", "password_hash": "412F68B618A8FAEDCCE289121AC4695C0046D2E45DB07EE512B4B3516DDA8B0F"}],
+    "BR": [{"uid": "3158668455", "password_hash": "44296D19343151B25DE68286BDC565904A0DA5A5CC5E96B7A7ADBE7C11E07933"}],
+}
+
 # كلمات مفتاحية تدل على وصول حد الإعجابات اليومي في ردود السيرفر
 LIMIT_KEYWORDS = (
     "limit", "daily", "reach", "max", "too many", "exceed", "full",
