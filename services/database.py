@@ -63,10 +63,13 @@ class Database:
                     ON used_likes(target_uid);
                 """
             )
-            # حقن الحسابات الجاهزة عند أول تشغيل (فقط إذا كان المخزون فارغاً)
+            # حقن الحسابات الجاهزة عند أول تشغيل (فقط إذا كان المخزون فارغاً
+            # وكانت هناك بذور). SEED_GUEST_ACCOUNTS فارغ حالياً عمداً — الحسابات
+            # المزروعة الملفَّقة كانت تسبب auth_error الدائم؛ المخزون يمتلئ
+            # تلقائياً بالحسابات الحقيقية التي تسجَّل بنجاح.
             cur = await db.execute("SELECT COUNT(*) AS c FROM guest_accounts")
             row = await cur.fetchone()
-            if row["c"] == 0:
+            if row["c"] == 0 and SEED_GUEST_ACCOUNTS:
                 for region, accounts in SEED_GUEST_ACCOUNTS.items():
                     for acc in accounts:
                         await db.execute(
@@ -246,3 +249,23 @@ class Database:
                 (account_uid, target_uid, region, int(time.time())),
             )
             await db.commit()
+
+    async def delete_guest_account(self, account_uid: str) -> None:
+        """يحذف حساباً جاهزاً من المخزون (مثلاً بعد رد auth_error من Garena)."""
+        async with self._conn() as db:
+            await db.execute(
+                "DELETE FROM guest_accounts WHERE account_uid = ?", (account_uid,)
+            )
+            await db.commit()
+
+    async def guest_stock_count(self, region: Optional[str] = None) -> int:
+        """عدد الحسابات الجاهزة المتبقية (كلها أو لمنطقة محددة)."""
+        async with self._conn() as db:
+            if region:
+                cur = await db.execute(
+                    "SELECT COUNT(*) AS c FROM guest_accounts WHERE region = ?", (region,)
+                )
+            else:
+                cur = await db.execute("SELECT COUNT(*) AS c FROM guest_accounts")
+            row = await cur.fetchone()
+        return int(row["c"])

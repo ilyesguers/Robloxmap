@@ -29,7 +29,7 @@ async def main() -> None:
         print(f"   ✔ OpenID: {guest.open_id[:16]}...")
 
         print("2) تسجيل الدخول (MajorLogin → JWT)...")
-        session = await client.major_login(guest.access_token, guest.open_id)
+        session = await client.major_login(guest.access_token, guest.open_id, "ME")
         print(f"   ✔ JWT: {session.jwt[:20]}...")
         print(f"   ✔ Server URL: {session.server_url}")
         print(f"   ✔ Account ID: {session.account_id}")
