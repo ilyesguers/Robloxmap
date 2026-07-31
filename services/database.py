@@ -10,6 +10,7 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple
 import aiosqlite
 
 from config import settings
+from services.garena import SEED_GUEST_ACCOUNTS
 
 
 class Database:
@@ -42,8 +43,37 @@ class Database:
                     reason    TEXT,
                     banned_at INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS guest_accounts (
+                    account_uid   TEXT PRIMARY KEY,
+                    region        TEXT NOT NULL,
+                    password_hash TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS used_likes (
+                    account_uid TEXT NOT NULL,
+                    target_uid  TEXT NOT NULL,
+                    region      TEXT NOT NULL,
+                    used_at     INTEGER NOT NULL,
+                    PRIMARY KEY (account_uid, target_uid)
+                );
+                CREATE INDEX IF NOT EXISTS idx_guest_accounts_region
+                    ON guest_accounts(region);
+                CREATE INDEX IF NOT EXISTS idx_used_likes_target
+                    ON used_likes(target_uid);
                 """
             )
+            # حقن الحسابات الجاهزة عند أول تشغيل (فقط إذا كان المخزون فارغاً)
+            cur = await db.execute("SELECT COUNT(*) AS c FROM guest_accounts")
+            row = await cur.fetchone()
+            if row["c"] == 0:
+                for region, accounts in SEED_GUEST_ACCOUNTS.items():
+                    for acc in accounts:
+                        await db.execute(
+                            "INSERT OR IGNORE INTO guest_accounts "
+                            "(account_uid, region, password_hash) VALUES (?, ?, ?)",
+                            (acc["uid"], region, acc["password_hash"]),
+                        )
             await db.commit()
 
     # ---------------- المستخدمون ----------------
@@ -167,3 +197,52 @@ class Database:
             cur = await db.execute("SELECT user_id FROM users")
             rows = await cur.fetchall()
         return [r["user_id"] for r in rows]
+
+    # ---------------- مخزون حسابات الضيوف الجاهزة ----------------
+    async def save_guest_account(self, account_uid: str, region: str, password_hash: str) -> None:
+        """يحفظ حساب ضيف في المخزون (مستخدم جديد سُجّل بنجاح)."""
+        async with self._conn() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO guest_accounts (account_uid, region, password_hash) "
+                "VALUES (?, ?, ?)",
+                (account_uid, region, password_hash),
+            )
+            await db.commit()
+
+    async def get_available_guest(
+        self, region: str, target_uid: str
+    ) -> Optional[Tuple[str, str]]:
+        """يعيد (uid, password_hash) لحساب جاهز غير مستخدم لهذا الهدف، أو None.
+
+        كل حساب يصلح لإعجاب واحد فقط لنفس الهدف: يُستثنى أي حساب مسجَّل
+        في used_likes لنفس (account_uid, target_uid).
+        """
+        async with self._conn() as db:
+            cur = await db.execute(
+                """
+                SELECT g.account_uid, g.password_hash
+                FROM guest_accounts g
+                WHERE g.region = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM used_likes u
+                      WHERE u.account_uid = g.account_uid AND u.target_uid = ?
+                  )
+                ORDER BY g.account_uid
+                LIMIT 1
+                """,
+                (region, target_uid),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return row["account_uid"], row["password_hash"]
+
+    async def mark_guest_used(self, account_uid: str, target_uid: str, region: str) -> None:
+        """يعلّم حساباً بأنه استُخدم لإعجاب على هدف معيّن (إعجاب واحد لكل هدف)."""
+        async with self._conn() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO used_likes (account_uid, target_uid, region, used_at) "
+                "VALUES (?, ?, ?, ?)",
+                (account_uid, target_uid, region, int(time.time())),
+            )
+            await db.commit()

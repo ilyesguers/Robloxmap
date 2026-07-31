@@ -234,11 +234,43 @@ class LikeEngine:
             waited += 0.25
         return True
 
-    # ---------------- إرسال إعجاب واحد بحساب ضيف جديد كامل ----------------
+    # ---------------- إرسال إعجاب واحد بحساب ضيف ----------------
     async def _send_one_like(self, job: LikeJob):
-        guest = await self.client.register_guest(job.region)
+        """يحاول تسجيل حساب ضيف جديد؛ عند الفشل (مثل error_not_found 1005 من
+        سيرفر Railway) يلجأ إلى مخزون الحسابات الجاهزة (كل حساب = إعجاب واحد
+        لنفس الهدف). إذا نجح التسجيل يُحفظ الحساب الجديد في المخزون."""
+        try:
+            guest = await self.client.register_guest(job.region)
+        except GarenaError:
+            return await self._like_from_stock(job)
+
+        # التسجيل نجح → احفظ الحساب الجديد في المخزون لاستخدامه لاحقاً
+        try:
+            await self.db.save_guest_account(guest.uid, guest.region, guest.password_hash)
+        except Exception as exc:  # noqa: BLE001 — الفشل هنا لا يوقف الإعجاب
+            logger.debug("تعذر حفظ الحساب الجديد في المخزون: %s", exc)
+
         session = await self.client.major_login(guest.access_token, guest.open_id)
-        return await self.client.send_like(session, job.target_uid, job.region)
+        result = await self.client.send_like(session, job.target_uid, job.region)
+        if result.success:
+            await self.db.mark_guest_used(guest.uid, job.target_uid, job.region)
+        return result
+
+    async def _like_from_stock(self, job: LikeJob):
+        """يستخدم حساباً جاهزاً من المخزون لإرسال إعجاب واحد لنفس الهدف."""
+        account = await self.db.get_available_guest(job.region, job.target_uid)
+        if account is None:
+            raise GarenaError(
+                f"فشل تسجيل حساب ضيف ولا توجد حسابات جاهزة متبقية لمنطقة "
+                f"{job.region} لهذا الهدف."
+            )
+        uid, password_hash = account
+        access_token, open_id = await self.client.token_grant(uid, password_hash)
+        session = await self.client.major_login(access_token, open_id)
+        result = await self.client.send_like(session, job.target_uid, job.region)
+        if result.success:
+            await self.db.mark_guest_used(uid, job.target_uid, job.region)
+        return result
 
     # ---------------- قراءة عدد الإعجابات (أفضل جهد) ----------------
     async def _read_likes(self, job: LikeJob) -> Optional[int]:
