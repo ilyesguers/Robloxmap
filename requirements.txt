@@ -1,2 +1,5 @@
-Flask
-google-generativeai
+aiogram>=3.13,<4
+aiohttp>=3.10,<4
+aiosqlite>=0.20
+python-dotenv>=1.0
+pycryptodome>=3.20
