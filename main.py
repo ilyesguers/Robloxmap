@@ -15,8 +15,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import settings
 from handlers import admin, user
 from middlewares.access_control import AccessControlMiddleware
-from services.api_client import FFAPIClient
 from services.database import Database
+from services.garena import GarenaClient
 from services.like_engine import LikeEngine
 from utils.logger import setup_logging
 
@@ -44,7 +44,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     # ---------- الخدمات المشتركة (تُحقن في المعالجات) ----------
-    api_client = FFAPIClient()
+    api_client = GarenaClient()
     await api_client.start()
     engine = LikeEngine(bot=bot, db=db, client=api_client)
 
