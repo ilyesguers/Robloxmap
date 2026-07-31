@@ -1,4 +1,4 @@
-"""لوحة تحكم الأدمن: /stats، /broadcast، /ban، /unban، /queue، /clear_queue.
+"""لوحة تحكم الأدمن: /stats، /broadcast، /ban، /unban، /queue، /clear_queue، /diag.
 
 كل هذه الأوامر تعمل فقط لصاحب البوت (ADMIN_ID من متغيرات البيئة).
 """
@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -109,3 +110,57 @@ async def admin_queue(message: Message, engine: LikeEngine) -> None:
 async def admin_clear_queue(message: Message, engine: LikeEngine) -> None:
     cleared = engine.clear_queue()
     await message.answer(f"🗑️ تم مسح {cleared} مهمة من قائمة الانتظار.")
+
+
+@router.message(Command("diag"))
+@router.message(Command("diagnostics"))
+async def admin_diag(message: Message, engine: LikeEngine) -> None:
+    """عرض التشخيص المفصل — Hybrid pool + fallbacks + errors"""
+    diag = engine.get_diagnostics()
+    eng = diag.get("engine", {})
+    gar = diag.get("garena", {})
+
+    reg = gar.get("register", {})
+    like = gar.get("like", {})
+    pool = gar.get("pool", {})
+
+    text = (
+        "🔍 <b>تشخيص البوت — Hybrid Pool + Fallbacks</b>\n\n"
+        f"🕒 Uptime: {gar.get('uptime_sec',0)}s\n"
+        f"📦 Jobs كلّي: {eng.get('total_jobs',0)} | Likes مرسلة: {eng.get('total_likes_sent',0)} | فشل: {eng.get('total_failed',0)}\n"
+        f"🎯 Limit hits: {eng.get('total_limit_hits',0)} | ملغاة: {eng.get('total_cancelled',0)}\n"
+        f"⏱ متوسط/لايك: {eng.get('avg_time_per_like',0)}s\n"
+        f"🌍 per region jobs: {eng.get('jobs_per_region',{})}\n"
+        f"❤️ per region likes: {eng.get('likes_per_region',{})}\n\n"
+        f"🧩 <b>Garena:</b>\n"
+        f"• Register: {reg.get('attempts',0)} محاولة / نجاح {reg.get('success',0)} / فشل {reg.get('failed',0)}\n"
+        f"  ↳ per region attempt: {reg.get('per_region_attempt',{})}\n"
+        f"  ↳ per region success: {reg.get('per_region_success',{})}\n"
+        f"• Token: {gar.get('token_grant',{}).get('attempts',0)} / نجاح {gar.get('token_grant',{}).get('success',0)}\n"
+        f"• MajorRegister: {gar.get('major_register',{}).get('attempts',0)} / نجاح {gar.get('major_register',{}).get('success',0)}\n"
+        f"• Login: {gar.get('login',{}).get('attempts',0)} / نجاح {gar.get('login',{}).get('success',0)} / فشل {gar.get('login',{}).get('failed',0)}\n"
+        f"• Like: محاولات {like.get('attempts',0)} / نجاح {like.get('success',0)} / فشل {like.get('failed',0)} / limit {like.get('limit_hits',0)}\n"
+        f"• Read: محاولات {gar.get('read',{}).get('attempts',0)} / نجاح {gar.get('read',{}).get('success',0)}\n\n"
+        f"🏊 <b>Pool:</b> hits={pool.get('hits',0)} miss={pool.get('miss',0)} current={pool.get('current_size',0)} "
+        f"| engine_pool={eng.get('pool_stats',{}).get('engine_pool',0)} read_cache={eng.get('pool_stats',{}).get('read_cache_regions',0)}\n"
+    )
+
+    # آخر أخطاء
+    last_errs = gar.get("last_errors", [])[-7:]
+    if last_errs:
+        text += "\n⚠️ آخر أخطاء:\n" + "\n".join(f"• {e[:120]}" for e in last_errs)
+
+    # قطع إلى 4000 حرف (حد تيليجرام)
+    if len(text) > 4000:
+        text = text[:4000]
+
+    await message.answer(text)
+
+
+@router.message(Command("clear_pool"))
+async def admin_clear_pool(message: Message, engine: LikeEngine) -> None:
+    cleared = engine.client.clear_pool()
+    # أيضاً نظّف كاش المحرك
+    engine._read_sessions_cache.clear()
+    engine._like_sessions_pool.clear()
+    await message.answer(f"🧹 تم مسح التجمع الهجين: {cleared} جلسة")
