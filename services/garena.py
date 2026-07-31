@@ -1,43 +1,53 @@
 """
-عميل Garena الحقيقي — الطريقة الشغالة الحالية (OB53).
+عميل Garena الحقيقي — محدّث للتدفق الشغال الحالي (OB54 — يوليو 2026).
 
-التدفق (مطابق تماماً لعميل المكتبة الشغالة @spinzaf/freefire-api — أبريل 2026):
+مصادر التحديث (تحقق مزدوج):
+  • ISMAILdz13/FreeFireLikesBot — آخر تحديث 2026-07-30، وملاحظة في الكود
+    «LikeProfile varint format — confirmed working 2026-07-29».
+  • @spinzaf/freefire-api وخليفته ffapis (مايو 2026).
 
-  1) تسجيل حساب ضيف جديد (Guest Register):
-     POST https://ffmconnect.live.gop.garenanow.com/oauth/guest/register
+التدفق الحالي (OB54):
+  1) تسجيل حساب ضيف (Guest Register):
+     POST https://connect.garena.com/oauth/guest/register   (مع بدائل)
      (form) password=SHA256(كلمة سر) & client_type=2 & source=2 & app_id=100067
-     التوقيع: HMAC-SHA256(client_secret, جسم الطلب) في header Authorization: Signature ...
+     التوقيع: HMAC-SHA256(client_secret, جسم الطلب) في  Authorization: Signature ...
 
   2) منح توكن (Token Grant):
-     POST .../oauth/guest/token/grant  →  access_token + open_id
+     POST https://100067.connect.garena.com/oauth/guest/token/grant
+     بدائل: v2 على ffmconnect.live.gop.garenanow.com/api/v2/oauth/guest/token:grant
+     ثم v1 على ffmconnect (القديم)
+     → access_token + open_id. (429 = حد معدل الطلبات → تراجع وانتظار)
 
   3) إنشاء الحساب داخل اللعبة (Major Register):
      POST https://loginbp.ggblueshark.com/MajorRegister
-     جسم = Protobuf مشفّر AES-128-CBC (مفتاح وIV ثابتان معروفان)
+     Protobuf مشفّر AES-128-CBC. الحقل 15 = اللغة (وليس المنطقة!) + حقل 17 = 1
 
   4) تسجيل الدخول (Major Login) → JWT:
-     POST https://loginbp.ggblueshark.com/MajorLogin
-     جسم = Protobuf (openid=22, logintoken=29, platform=99) مشفّر AES-128-CBC
-     الرد = Protobuf → token(JWT) + serverUrl
+     يُحاول بالترتيب: ggpolarbear ← ME أولاً على common.ggbluefox ← ثم ggblueshark
+     الجسم = Protobuf MajorLogin كامل (الحقول 3..100) مشفّر AES-128-CBC
+     الرد: token=JWT (حقل 8)، url=serverUrl (حقل 10)، region (حقل 2)
 
-  5) إرسال الإعجاب:
+  5) إرسال الإعجاب (الصيغة الجديدة المؤكدة 2026-07-29):
      POST {serverUrl}/LikeProfile
-     جسم = Protobuf (الهدف uid كـ string في الحقل 1، المنطقة في الحقل 2) مشفّر AES
+     الجسم = 0x08 + varint(uid الهدف) + 0x10 + varint(كود المنطقة)  ← varint وليس نصوصاً!
+     أكواد المناطق: ME=7, IND=1, BR=2, SG=3, TH=4, PH=5, VN=6, RU=8, US=9, PK=10, BD=11, TW=12
 
-  6) التحقق من عدد الإعجابات:
-     POST {serverUrl}/GetPlayerPersonalShow → حقل liked = 21
+  6) التحقق من عدد الإعجابات: POST {serverUrl}/GetPlayerPersonalShow
 
-⚠️ ملاحظة أمان: كل المفاتيح والروابط هنا ثابتة في الكود حتى لا تحتاج
-أي متغيرات بيئة إضافية على Railway (يكفي BOT_TOKEN و ADMIN_ID).
-إذا غيّرت Garena هذه القيم في تحديث مستقبلي، عدّلها من أعلى هذا الملف فقط.
+⚠️ ملاحظة أمان: القيم ثابتة في الكود حتى لا تحتاج متغيرات بيئة إضافية على
+Railway (يكفي BOT_TOKEN و ADMIN_ID). إذا غيّرت Garena القيم، عدّلها من أعلى
+هذا الملف فقط.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
+import json
 import logging
 import random
+import string
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,63 +61,100 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # ==========================================================================
-# الثوابت الحقيقية — OB53 (مطابقة للعميل الشغال الحالي)
+# الثوابت — OB54 (يوليو 2026)
 # ==========================================================================
-AES_KEY = b"Yg&tc%DEuh6%Zc^8"          # مفتاح AES-128-CBC
-AES_IV = b"6oyZDr22E3ychjM%"           # IV ثابت
+AES_KEY = b"Yg&tc%DEuh6%Zc^8"          # مفتاح AES-128-CBC (لم يتغير)
+AES_IV = b"6oyZDr22E3ychjM%"           # IV ثابت (لم يتغير)
 
 CLIENT_ID = "100067"
 CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 
-URL_GUEST_REGISTER = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/register"
-URL_TOKEN_GRANT = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
-URL_MAJOR_REGISTER = "https://loginbp.ggblueshark.com/MajorRegister"
-URL_MAJOR_LOGIN = "https://loginbp.ggblueshark.com/MajorLogin"
+# --- OAuth (تسجيل الضيوف + منح التوكن) -----------------------------------
+# الرئيسي أولاً ثم البدائل. systemd-smoke-test يستبدل هذه القيم بسيرفر وهمي.
+URL_GUEST_REGISTER = "https://connect.garena.com/oauth/guest/register"
+GUEST_REGISTER_FALLBACKS: List[str] = [
+    "https://100067.connect.garena.com/oauth/guest/register",
+    "https://ffmconnect.live.gop.garenanow.com/oauth/guest/register",
+]
+URL_TOKEN_GRANT = "https://100067.connect.garena.com/oauth/guest/token/grant"
+TOKEN_GRANT_FALLBACKS: List[str] = [
+    "https://ffmconnect.live.gop.garenanow.com/api/v2/oauth/guest/token:grant",
+    "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant",
+]
 
-UA_GARENA = "GarenaMSDK/4.0.19P9(A063 ;Android 13;en;IN;)"
-UA_DALVIK = "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)"
-RELEASE_VERSION = "OB53"
+# --- داخل اللعبة ----------------------------------------------------------
+URL_MAJOR_REGISTER = "https://loginbp.ggblueshark.com/MajorRegister"
+
+# MajorLogin: الترتيب الافتراضي (ME تبدأ بـ ggbluefox)
+URL_MAJOR_LOGIN = "https://loginbp.ggpolarbear.com/MajorLogin"
+MAJOR_LOGIN_FALLBACKS: List[str] = [
+    "https://loginbp.common.ggbluefox.com/MajorLogin",
+    "https://loginbp.ggblueshark.com/MajorLogin",
+]
+MAJOR_LOGIN_ME_FIRST = "https://loginbp.common.ggbluefox.com/MajorLogin"
+
+UA_GARENA = "GarenaMSDK/4.0.19P8(ASUS_Z01QD ;Android 12;en;US;)"
+UA_DALVIK = "Dalvik/2.1.0 (Linux; U; Android 11; ASUS_Z01QD Build/PI)"
+RELEASE_VERSION = "OB54"
 X_UNITY_VERSION = "2018.4.11f1"
 
-# سيرفرات اللعبة حسب المنطقة (تُستخدم كاحتياط إذا لم يرسل MajorLogin serverUrl)
+# بيانات عميل MajorLogin (مطابقة لعميل OB54 الحالي)
+CLIENT_VERSION = "1.126.2"
+CLIENT_VERSION_CODE = "2024010012"
+
+# --- سيرفرات اللعبة (clientbp) -------------------------------------------
+# المرجع الشغال يرسل LikeProfile دائماً تقريباً إلى ggpolarbear؛ نفضّل serverUrl
+# العائد من MajorLogin ثم ggpolarbear ثم خريطة المناطق.
+DEFAULT_SERVER = "https://clientbp.ggpolarbear.com"
 SERVER_BASE: Dict[str, str] = {
+    "ME": "https://clientbp.common.ggbluefox.com",
     "IND": "https://client.ind.freefiremobile.com",
     "BR": "https://client.us.freefiremobile.com",
     "US": "https://client.us.freefiremobile.com",
-    "SAC": "https://client.us.freefiremobile.com",
     "NA": "https://client.us.freefiremobile.com",
-}
-DEFAULT_SERVER = "https://clientbp.ggblueshark.com"
-
-# المناطق التي تدعم تسجيل الحسابات الضيفية (حسب أحدث عميل شغال)
-GUEST_REGIONS: List[str] = ["IND", "SG", "BR", "US", "RU", "TH", "VN", "TW", "ME", "CIS", "BD"]
-
-# ==========================================================================
-# مخزون الحسابات الجاهزة — تُستخدم عندما يرفض Garena تسجيل ضيف جديد من سيرفر
-# Railway (خطأ error_not_found 1005). كل منطقة لها حساب جاهز (uid + password_hash).
-# كل حساب يصلح لإعجاب واحد فقط لنفس الهدف (بعد الاستخدام يُعلَّم كمستخدم).
-# ==========================================================================
-SEED_GUEST_ACCOUNTS: Dict[str, List[Dict[str, str]]] = {
-    "IND": [{"uid": "4104125669", "password_hash": "E5655A0D14EF812A908726152BDD38021BEF528801AA42B16CFA4ED67141C4CA"}],
-    "SG": [{"uid": "3158350464", "password_hash": "70EA041FCF79190E3D0A8F3CA95CAAE1F39782696CE9D85C2CCD525E28D223FC"}],
-    "RU": [{"uid": "3301239795", "password_hash": "DD40EE772FCBD61409BB15033E3DE1B1C54EDA83B75DF0CDD24C34C7C8798475"}],
-    "ID": [{"uid": "3301269321", "password_hash": "D11732AC9BBED0DED65D0FED7728CA8DFF408E174202ECF1939E328EA3E94356"}],
-    "TW": [{"uid": "3301329477", "password_hash": "359FB179CD92C9C1A2A917293666B96972EF8A5FC43B5D9D61A2434DD3D7D0BC"}],
-    "US": [{"uid": "3301387397", "password_hash": "BAC03CCF677F8772473A09870B6228ADFBC1F503BF59C8D05746DE451AD67128"}],
-    "VN": [{"uid": "3301447047", "password_hash": "044714F5B9284F3661FB09E4E9833327488B45255EC9E0CCD953050E3DEF1F54"}],
-    "TH": [{"uid": "3301470613", "password_hash": "39EFD9979BD6E9CCF6CBFF09F224C4B663E88B7093657CB3D4A6F3615DDE057A"}],
-    "ME": [{"uid": "3301535568", "password_hash": "BEC9F99733AC7B1FB139DB3803F90A7E78757B0BE395E0A6FE3A520AF77E0517"}],
-    "PK": [{"uid": "3301828218", "password_hash": "3A0E972E57E9EDC39DC4830E3D486DBFB5DA7C52A4E8B0B8F3F9DC4450899571"}],
-    "CIS": [{"uid": "3309128798", "password_hash": "412F68B618A8FAEDCCE289121AC4695C0046D2E45DB07EE512B4B3516DDA8B0F"}],
-    "BR": [{"uid": "3158668455", "password_hash": "44296D19343151B25DE68286BDC565904A0DA5A5CC5E96B7A7ADBE7C11E07933"}],
+    "SAC": "https://client.us.freefiremobile.com",
 }
 
-# كلمات مفتاحية تدل على وصول حد الإعجابات اليومي في ردود السيرفر
+# أكواد المناطق الرقمية لصيغة LikeProfile الجديدة (varint — مؤكدة 2026-07-29)
+REGION_CODES: Dict[str, int] = {
+    "IND": 1, "ID": 1, "INDONESIA": 1,
+    "BR": 2, "BRA": 2,
+    "SG": 3,
+    "TH": 4,
+    "PH": 5,
+    "VN": 6,
+    "ME": 7,
+    "RU": 8, "CIS": 8,
+    "US": 9, "NA": 9,
+    "PK": 10,
+    "BD": 11,
+    "TW": 12,
+}
+DEFAULT_REGION_CODE = 7  # ME كافتراضي (الأكثر استخداماً)
+
+# لغة الحقل 15 في MajorRegister حسب المنطقة
+REGION_LANG: Dict[str, str] = {
+    "ME": "ar", "IND": "hi", "ID": "id", "VN": "vi", "TH": "th",
+    "BD": "bn", "PK": "ur", "TW": "zh", "RU": "ru", "CIS": "ru",
+    "BR": "pt", "SAC": "es",
+}
+
+# ==========================================================================
+# ⚠️ لا حسابات جاهزة مزروعة.
+# النسخة السابقة كانت تحتوي حسابات "جاهزة" مُنشأة يدوياً — uid/password_hash
+# غير موجودة فعلياً في Garena، لذا كان Token Grant يرد {'error': 'auth_error'}
+# ويتكرر نفس الخطأ إلى ما لا نهاية. بقيت القائمة فارغة عمداً: المخزون في قاعدة
+# البيانات يمتلئ تلقائياً بحسابات حقيقية (تُسجَّل بنجاح) فقط.
+# ==========================================================================
+SEED_GUEST_ACCOUNTS: Dict[str, List[Dict[str, str]]] = {}
+
+# كلمات مفتاحية تدل على بلوغ الحد اليومي في ردود السيرفر
 LIMIT_KEYWORDS = (
     "limit", "daily", "reach", "max", "too many", "exceed", "full",
     "quota", "cooldown", "already", "banned", "ban", "blocked", "denied",
     "forbidden", "frequently", "restrict",
 )
+
 
 # ==========================================================================
 # أخطاء
@@ -157,7 +204,7 @@ class PlayerInfo:
 
 
 # ==========================================================================
-# أدوات Protobuf (ترميز يدوي — بسيط وسريع بدون مكتبات خارجية)
+# أدوات Protobuf (ترميز يدوي — بدون مكتبات خارجية)
 # ==========================================================================
 def _varint_encode(n: int) -> bytes:
     out = bytearray()
@@ -169,8 +216,7 @@ def _varint_encode(n: int) -> bytes:
 
 
 def _read_varint(data: bytes, i: int) -> Tuple[int, int]:
-    result = 0
-    shift = 0
+    result, shift = 0, 0
     while True:
         byte = data[i]
         i += 1
@@ -193,29 +239,32 @@ def _field_string(num: int, value: str) -> bytes:
 
 
 def _parse_protobuf(data: bytes) -> Dict[int, List[Any]]:
-    """فك Protobuf بسيط: كل حقل → قائمة قيمه (varint أو bytes)."""
+    """فك Protobuf بسيط: كل حقل → قائمة قيمه (varint أو bytes). متسامح مع البيانات التالفة."""
     fields: Dict[int, List[Any]] = {}
     i = 0
     while i < len(data):
-        tag, i = _read_varint(data, i)
-        num, wire = tag >> 3, tag & 0x07
-        if num == 0:
+        try:
+            tag, i = _read_varint(data, i)
+            num, wire = tag >> 3, tag & 0x07
+            if num == 0:
+                break
+            if wire == 0:  # varint
+                val, i = _read_varint(data, i)
+                fields.setdefault(num, []).append(val)
+            elif wire == 2:  # length-delimited
+                ln, i = _read_varint(data, i)
+                fields.setdefault(num, []).append(data[i : i + ln])
+                i += ln
+            elif wire == 5:  # 32-bit
+                fields.setdefault(num, []).append(data[i : i + 4])
+                i += 4
+            elif wire == 1:  # 64-bit
+                fields.setdefault(num, []).append(data[i : i + 8])
+                i += 8
+            else:
+                break  # wire type غير معروف — نتوقف
+        except Exception:
             break
-        if wire == 0:  # varint
-            val, i = _read_varint(data, i)
-            fields.setdefault(num, []).append(val)
-        elif wire == 2:  # length-delimited
-            ln, i = _read_varint(data, i)
-            fields.setdefault(num, []).append(data[i : i + ln])
-            i += ln
-        elif wire == 5:  # 32-bit
-            fields.setdefault(num, []).append(data[i : i + 4])
-            i += 4
-        elif wire == 1:  # 64-bit
-            fields.setdefault(num, []).append(data[i : i + 8])
-            i += 8
-        else:
-            break  # wire type غير معروف — نتوقف
     return fields
 
 
@@ -226,6 +275,15 @@ def _aes_encrypt(data: bytes) -> bytes:
     pad_len = 16 - (len(data) % 16)
     data = data + bytes([pad_len]) * pad_len
     return AES.new(AES_KEY, AES.MODE_CBC, AES_IV).encrypt(data)
+
+
+def _aes_decrypt(data: bytes) -> bytes:
+    """فك التشفير (للاختبارات واستكشاف الأخطاء)."""
+    raw = AES.new(AES_KEY, AES.MODE_CBC, AES_IV).decrypt(data)
+    if not raw:
+        return b""
+    pad_len = raw[-1]
+    return raw[:-pad_len] if 1 <= pad_len <= 16 else raw
 
 
 _XOR_KEY = bytes(
@@ -251,6 +309,64 @@ def _deep_get(obj: Any, *paths: str) -> Any:
         if current is not None:
             return current
     return None
+
+
+def _build_major_login_proto(open_id: str, access_token: str) -> bytes:
+    """جسم MajorLogin الكامل — مطابق لبروتو MajorLoginReq في OB54
+    (أرقام الحقول مستخرجة من MajoRLoGinrEq_pb2 المحدّث)."""
+    gs = _field_varint(6, 55) + _field_varint(8, 81)      # memory_available (GameSecurity)
+    analytics = base64.b64decode("FwQVTgUPX1UaUllDDwcWCRBpWAUOUgsvA1snWlBaO1kFYg==")
+    body = b"".join([
+        _field_string(3, time.strftime("%Y-%m-%d %H:%M:%S")),   # event_time
+        _field_string(4, "free fire"),                          # game_name
+        _field_varint(5, 2),                                    # platform_id
+        _field_string(7, CLIENT_VERSION),                       # client_version
+        _field_string(8, "Android OS 11 / API-30 (RQ3A.210805.001)"),
+        _field_string(9, "Handheld"),                           # system_hardware
+        _field_string(10, "Verizon"),                           # telecom_operator
+        _field_string(11, "WIFI"),                              # network_type
+        _field_varint(12, 1080),                                # screen_width
+        _field_varint(13, 2400),                                # screen_height
+        _field_string(14, "440"),                               # screen_dpi
+        _field_string(15, "ARMv8"),                             # processor_details
+        _field_varint(16, 6144),                                # memory
+        _field_string(17, "Adreno (TM) 650"),                   # gpu_renderer
+        _field_string(18, "OpenGL ES 3.2 V@1.50"),              # gpu_version
+        _field_string(19, "Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57"),
+        _field_string(20, ""),                                  # client_ip
+        _field_string(21, "en"),                                # language
+        _field_string(22, open_id),                             # ★ open_id
+        _field_string(23, "4"),                                 # open_id_type
+        _field_string(24, "Handheld"),                          # device_type
+        _field_bytes(25, gs),                                   # memory_available
+        _field_string(29, access_token),                        # ★ access_token
+        _field_varint(30, 2),                                   # platform_sdk_id
+        _field_string(41, "Verizon"),                           # network_operator_a
+        _field_string(42, "WIFI"),                              # network_type_a
+        _field_string(57, "7428b253defc164018c604a1ebbfebdf"),  # client_using_version
+        _field_varint(60, 128512),                              # external_storage_total
+        _field_varint(61, random.randint(38000, 52000)),
+        _field_varint(62, 110731),                              # internal_storage_total
+        _field_varint(63, random.randint(18000, 32000)),
+        _field_varint(64, random.randint(18000, 25000)),
+        _field_varint(65, 26628),                               # game_disk_storage_total
+        _field_varint(66, random.randint(25000, 60000)),
+        _field_varint(67, 119234),                              # external_sdcard_total
+        _field_varint(73, 3),                                   # login_by
+        _field_string(74, "/data/app/~~random/base.apk"),       # library_path
+        _field_string(77, "hash|base.apk"),                     # library_token
+        _field_varint(79, 2),                                   # cpu_type
+        _field_string(81, "64"),                                # cpu_architecture
+        _field_string(83, CLIENT_VERSION_CODE),                 # client_version_code
+        _field_string(86, "OpenGLES3"),                         # graphics_api
+        _field_varint(87, 16383),                               # supported_astc_bitset
+        _field_varint(88, 4),                                   # login_open_id_type
+        _field_bytes(89, analytics),                            # analytics_detail
+        _field_varint(92, random.randint(9000, 18000)),         # loading_time
+        _field_string(99, "4"),                                 # origin_platform_type
+        _field_string(100, "4"),                                # primary_platform_type
+    ])
+    return body
 
 
 # ==========================================================================
@@ -310,7 +426,7 @@ class GarenaClient:
     async def _post_form(
         self, url: str, params: Dict[str, str], headers: Dict[str, str]
     ) -> Dict[str, Any]:
-        """POST برسالة form-urlencoded ويعيد JSON."""
+        """POST برسالة form-urlencoded ويعيد {status, json, raw?}."""
         assert self._session is not None
         proxy = await self._next_proxy()
         async with self._session.post(
@@ -318,7 +434,7 @@ class GarenaClient:
         ) as resp:
             text = await resp.text()
             try:
-                return {"status": resp.status, "json": json_loads(text)}
+                return {"status": resp.status, "json": json.loads(text)}
             except Exception:
                 return {"status": resp.status, "json": {}, "raw": text}
 
@@ -337,11 +453,11 @@ class GarenaClient:
     # 1) تسجيل حساب ضيف جديد كامل (register + token + major register)
     # ------------------------------------------------------------------
     async def register_guest(self, region: str, nickname: Optional[str] = None) -> GuestAccount:
-        password = str(random.randint(10**9, 10**10 - 1))
+        password = "".join(random.choices(string.ascii_uppercase + string.digits, k=14))
         password_hash = hashlib.sha256(password.encode()).hexdigest().upper()
         nick = nickname or f"Liker{random.randint(1000, 9999)}"
 
-        # ---- 1.1 Guest Register ----
+        # ---- 1.1 Guest Register (نجرب المضيف الأساسي ثم البدائل) ----
         params = {
             "password": password_hash,
             "client_type": "2",
@@ -358,19 +474,32 @@ class GarenaClient:
             "Authorization": f"Signature {signature}",
             "Content-Type": "application/x-www-form-urlencoded",
         }
-        resp = await self._post_form(URL_GUEST_REGISTER, params, headers)
-        data = resp.get("json", {})
-        uid = _deep_get(data, "uid", "data.uid")
-        if not uid or resp.get("status", 0) != 200:
-            raise GarenaError(
-                f"فشل تسجيل حساب ضيف ({region}): {str(resp.get('raw') or data)[:200]}"
-            )
-        uid = str(uid)
+        uid: Optional[str] = None
+        last_err = "بدون رد"
+        for url in _unique([URL_GUEST_REGISTER, *GUEST_REGISTER_FALLBACKS]):
+            try:
+                resp = await self._post_form(url, params, headers)
+            except Exception as exc:  # شبكة/مهلة
+                last_err = f"{url.split('/')[2]}: {type(exc).__name__}"
+                logger.debug("Guest Register عبر %s فشل: %s", url, exc)
+                continue
+            data = resp.get("json", {}) or {}
+            got = _deep_get(data, "uid", "data.uid")
+            if got and resp.get("status") == 200:
+                uid = str(got)
+                if url != URL_GUEST_REGISTER:
+                    logger.info("Guest Register نجح عبر المضيف البديل: %s", url)
+                break
+            last_err = str(resp.get("raw") or data)[:200] + f" (HTTP {resp.get('status')})"
+            logger.debug("Guest Register عبر %s فشل: %s", url, last_err)
+        if not uid:
+            raise GarenaError(f"فشل تسجيل حساب ضيف ({region}): {last_err}")
 
         # ---- 1.2 Token Grant ----
         access_token, open_id = await self.token_grant(uid, password_hash)
 
-        # ---- 1.3 Major Register (إنشاء الحساب كاملاً: nickname + region) ----
+        # ---- 1.3 Major Register (الحقل 15 = اللغة، والحقل 17 = 1 — OB54) ----
+        lang = REGION_LANG.get(region.upper(), "en")
         body = (
             _field_string(1, nick)
             + _field_string(2, access_token)
@@ -380,8 +509,9 @@ class GarenaClient:
             + _field_varint(7, 1)
             + _field_varint(13, 1)
             + _field_bytes(14, _xor_encrypt_openid(open_id))
-            + _field_string(15, region)
+            + _field_string(15, lang)
             + _field_varint(16, 1)
+            + _field_varint(17, 1)
         )
         enc = _aes_encrypt(body)
         reg_headers = {
@@ -391,7 +521,6 @@ class GarenaClient:
             "ReleaseVersion": RELEASE_VERSION,
             "Content-Type": "application/octet-stream",
             "User-Agent": UA_GARENA,
-            "Host": "loginbp.ggblueshark.com",
             "Connection": "Keep-Alive",
             "Accept-Encoding": "gzip",
         }
@@ -411,11 +540,11 @@ class GarenaClient:
         )
 
     # ------------------------------------------------------------------
-    # 2) منح التوكن (لحساب ضيف موجود)
+    # 2) منح التوكن (لحساب ضيف موجود) — مع بدائل v1/v2 وتراجع 429
     # ------------------------------------------------------------------
     async def token_grant(self, uid: str, password_hash: str) -> Tuple[str, str]:
         params = {
-            "uid": uid,
+            "uid": str(uid),
             "password": password_hash,
             "response_type": "token",
             "client_type": "2",
@@ -426,26 +555,46 @@ class GarenaClient:
             "User-Agent": UA_GARENA,
             "Connection": "Keep-Alive",
             "Accept-Encoding": "gzip",
+            "Content-Type": "application/x-www-form-urlencoded",
         }
-        resp = await self._post_form(URL_TOKEN_GRANT, params, headers)
-        data = resp.get("json", {})
-        access_token = _deep_get(data, "access_token", "data.access_token")
-        open_id = _deep_get(data, "open_id", "data.open_id")
-        if not access_token:
-            raise GarenaError(
-                f"Token Grant فشل: {str(resp.get('raw') or data)[:200]}"
-            )
-        return str(access_token), str(open_id)
+        last_err = "بدون رد"
+        for url in _unique([URL_TOKEN_GRANT, *TOKEN_GRANT_FALLBACKS]):
+            for attempt in range(3):  # تراجع عند 429
+                try:
+                    resp = await self._post_form(url, params, headers)
+                except Exception as exc:  # شبكة/مهلة
+                    last_err = f"{url.split('/')[2]}: {type(exc).__name__}"
+                    break
+                data = resp.get("json", {}) or {}
+                access_token = _deep_get(data, "access_token", "data.access_token")
+                open_id = _deep_get(data, "open_id", "data.open_id")
+                if access_token and resp.get("status") == 200:
+                    return str(access_token), str(open_id)
+                last_err = str(resp.get("raw") or data)[:200]
+                if resp.get("status") == 429 and attempt < 2:
+                    wait = 5 * (attempt + 1)
+                    logger.warning("Token Grant 429 — انتظار %ds وإعادة المحاولة", wait)
+                    await asyncio.sleep(wait)
+                    continue
+                # auth_error أو غيره → لا فائدة من إعادة المحاولة على نفس المضيف
+                logger.debug("Token Grant عبر %s فشل: %s", url, last_err)
+                break
+        raise GarenaError(f"Token Grant فشل: {last_err}")
 
     # ------------------------------------------------------------------
     # 3) تسجيل الدخول (Major Login) → JWT + serverUrl
+    #    جسم Protobuf كامل (OB54) + مضيفات حسب المنطقة
     # ------------------------------------------------------------------
-    async def major_login(self, access_token: str, open_id: str) -> LoginSession:
-        body = (
-            _field_string(22, open_id)
-            + _field_string(29, access_token)
-            + _field_string(99, "4")
-        )
+    def _major_login_urls(self, region: str) -> List[str]:
+        urls = [URL_MAJOR_LOGIN, *MAJOR_LOGIN_FALLBACKS]
+        if region.upper() in ("ME", "TH"):
+            urls.insert(0, MAJOR_LOGIN_ME_FIRST)
+        return _unique(urls)
+
+    async def major_login(
+        self, access_token: str, open_id: str, region: str = "ME"
+    ) -> LoginSession:
+        body = _build_major_login_proto(open_id, access_token)
         enc = _aes_encrypt(body)
         headers = {
             "User-Agent": UA_DALVIK,
@@ -458,29 +607,65 @@ class GarenaClient:
             "Content-Type": "application/octet-stream",
             "Authorization": "Bearer",
         }
-        status, raw = await self._post_raw(URL_MAJOR_LOGIN, enc, headers)
-        if status != 200:
-            raise GarenaError(f"MajorLogin فشل (HTTP {status}): {raw[:100]!r}")
+        last_err = "بدون رد"
+        for url in self._major_login_urls(region):
+            try:
+                status, raw = await self._post_raw(url, enc, headers)
+            except Exception as exc:  # شبكة/مهلة
+                last_err = f"{url.split('/')[2]}: {type(exc).__name__}"
+                logger.debug("MajorLogin عبر %s فشل: %s", url, exc)
+                continue
+            if status != 200:
+                last_err = f"{url.split('/')[2]}: HTTP {status} {raw[:60]!r}"
+                logger.debug("MajorLogin عبر %s فشل: %s", url, last_err)
+                continue
 
-        fields = _parse_protobuf(raw)
-        jwt = _bytes_to_str(fields.get(8, [None])[0])
-        if not jwt:
-            raise GarenaError("MajorLogin لم يعد JWT — الاستجابة غير متوقعة")
+            fields = _parse_protobuf(raw)
+            jwt = _bytes_to_str(fields.get(8, [None])[0])
+            if not jwt:
+                # احتياط: مسح البايتات عن JWT مباشرة (تغيّر أرقام الحقول)
+                jwt = _scan_jwt(raw)
+            if not jwt:
+                blacklist = _bytes_to_str(fields.get(6, [None])[0]) or _bytes_to_str(
+                    fields.get(25, [None])[0]
+                )
+                last_err = f"{url.split('/')[2]}: رد بلا JWT ({len(raw)} بايت)"
+                if blacklist:
+                    last_err += f" [حظر: {blacklist[:80]}]"
+                logger.debug("MajorLogin عبر %s: %s", url, last_err)
+                continue
 
-        server_url = _bytes_to_str(fields.get(10, [None])[0]) or self._base_server()
-        account_id = next((v for v in fields.get(1, []) if isinstance(v, int)), None)
-        lock_region = _bytes_to_str(fields.get(2, [None])[0]) or ""
-        return LoginSession(
-            jwt=jwt, server_url=server_url, account_id=account_id, lock_region=lock_region
+            server_url = _bytes_to_str(fields.get(10, [None])[0]) or ""
+            account_id = next((v for v in fields.get(1, []) if isinstance(v, int)), None)
+            lock_region = _bytes_to_str(fields.get(2, [None])[0]) or region
+            if url != URL_MAJOR_LOGIN:
+                logger.info("MajorLogin نجح عبر المضيف البديل: %s", url.split("/")[2])
+            return LoginSession(
+                jwt=jwt,
+                server_url=server_url,
+                account_id=account_id,
+                lock_region=lock_region,
+            )
+        raise GarenaError(f"MajorLogin فشل على كل المضيفات: {last_err}")
+
+    # ------------------------------------------------------------------
+    # 4) إرسال الإعجاب — الصيغة الجديدة (varint — مؤكدة 2026-07-29)
+    #    الجسم: 0x08 + varint(uid) + 0x10 + varint(كود المنطقة)
+    # ------------------------------------------------------------------
+    def _like_bases(self, session: LoginSession, region: str) -> List[str]:
+        return _unique(
+            [
+                session.server_url,
+                DEFAULT_SERVER,
+                SERVER_BASE.get(region.upper(), DEFAULT_SERVER),
+            ]
         )
 
-    # ------------------------------------------------------------------
-    # 4) إرسال الإعجاب
-    # ------------------------------------------------------------------
     async def send_like(
         self, session: LoginSession, target_uid: str, region: str
     ) -> LikeResult:
-        body = _field_string(1, str(target_uid)) + _field_string(2, region)
+        region_code = REGION_CODES.get(region.upper(), DEFAULT_REGION_CODE)
+        body = _field_varint(1, int(target_uid)) + _field_varint(2, region_code)
         enc = _aes_encrypt(body)
         headers = {
             "User-Agent": UA_DALVIK,
@@ -493,26 +678,32 @@ class GarenaClient:
             "X-GA": "v1 1",
             "ReleaseVersion": RELEASE_VERSION,
         }
-        url = f"{session.server_url.rstrip('/')}/LikeProfile"
-        status, raw = await self._post_raw(url, enc, headers)
-
-        if status == 200:
-            return LikeResult(success=True)
-
-        text = raw.decode("utf-8", errors="ignore").lower()
-        if any(k in text for k in LIMIT_KEYWORDS) or status in (403, 429):
-            return LikeResult(
-                success=False,
-                limit_reached=True,
-                message=f"HTTP {status}: {text[:120]}",
-            )
-        return LikeResult(success=False, message=f"HTTP {status}: {text[:120]}")
+        last_msg = ""
+        for base in self._like_bases(session, region):
+            url = f"{base.rstrip('/')}/LikeProfile"
+            try:
+                status, raw = await self._post_raw(url, enc, headers)
+            except Exception as exc:  # شبكة/مهلة
+                last_msg = f"{type(exc).__name__} عبر {base.split('/')[2]}"
+                continue
+            if status == 200:
+                return LikeResult(success=True)
+            text = raw.decode("utf-8", errors="ignore").lower()
+            if any(k in text for k in LIMIT_KEYWORDS) or status == 429:
+                return LikeResult(
+                    success=False,
+                    limit_reached=True,
+                    message=f"HTTP {status}: {text[:120]}",
+                )
+            last_msg = f"HTTP {status}: {text[:120]}"
+            logger.debug("LikeProfile عبر %s: %s", base, last_msg)
+        return LikeResult(success=False, message=last_msg or "فشل غير معروف")
 
     # ------------------------------------------------------------------
-    # 5) جلب معلومات اللاعب (للتحقق من أن عدد الإعجابات زاد فعلاً)
+    # 5) جلب معلومات اللاعب (أفضل جهد)
     # ------------------------------------------------------------------
     async def get_player_info(
-        self, session: LoginSession, uid: str
+        self, session: LoginSession, uid: str, region: str = "ME"
     ) -> Optional[PlayerInfo]:
         body = (
             _field_varint(1, int(uid))
@@ -530,12 +721,17 @@ class GarenaClient:
             "X-GA": "v1 1",
             "ReleaseVersion": RELEASE_VERSION,
         }
-        url = f"{session.server_url.rstrip('/')}/GetPlayerPersonalShow"
-        status, raw = await self._post_raw(url, enc, headers)
-        if status != 200:
-            return None
-        likes, nickname = self._extract_player_info(raw)
-        return PlayerInfo(uid=str(uid), nickname=nickname, likes=likes)
+        for base in self._like_bases(session, region):
+            url = f"{base.rstrip('/')}/GetPlayerPersonalShow"
+            try:
+                status, raw = await self._post_raw(url, enc, headers)
+            except Exception:  # noqa: BLE001
+                continue
+            if status != 200:
+                continue
+            likes, nickname = self._extract_player_info(raw)
+            return PlayerInfo(uid=str(uid), nickname=nickname, likes=likes)
+        return None
 
     @staticmethod
     def _extract_player_info(raw: bytes) -> Tuple[Optional[int], Optional[str]]:
@@ -543,8 +739,10 @@ class GarenaClient:
         liked: Optional[int] = None
         nickname: Optional[str] = None
 
-        def walk(data: bytes) -> None:
+        def walk(data: bytes, depth: int = 0) -> None:
             nonlocal liked, nickname
+            if depth > 6:
+                return
             fields = _parse_protobuf(data)
             for num, values in fields.items():
                 for val in values:
@@ -557,7 +755,7 @@ class GarenaClient:
                                 nickname = val.decode("utf-8")
                             except UnicodeDecodeError:
                                 pass
-                        walk(val)
+                        walk(val, depth + 1)
 
         try:
             walk(raw)
@@ -565,25 +763,35 @@ class GarenaClient:
             return None, None
         return liked, nickname
 
-    # ------------------------------------------------------------------
-    # مساعدات
-    # ------------------------------------------------------------------
-    def _base_server(self, region: Optional[str] = None) -> str:
-        if region:
-            return SERVER_BASE.get(region.upper(), DEFAULT_SERVER)
-        return DEFAULT_SERVER
+
+def _unique(seq: List[str]) -> List[str]:
+    """إزالة التكرار مع الحفاظ على الترتيب وتجاهل الفراغات."""
+    seen: Dict[str, None] = {}
+    for item in seq:
+        if item and item not in seen:
+            seen[item] = None
+    return list(seen)
+
+
+def _scan_jwt(raw: bytes) -> str:
+    """البحث الخام عن JWT داخل الرد (يبدأ بـ eyJhbGci)."""
+    try:
+        text = raw.decode("latin1")
+    except Exception:  # noqa: BLE001
+        return ""
+    idx = text.find("eyJhbGci")
+    if idx == -1:
+        return ""
+    token = []
+    for ch in text[idx:]:
+        if ch.isalnum() or ch in "-_.":
+            token.append(ch)
+        else:
+            break
+    return "".join(token) if len(token) > 20 else ""
 
 
 def _bytes_to_str(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="ignore")
     return ""
-
-
-def json_loads(text: str) -> Any:
-    import json
-
-    try:
-        return json.loads(text)
-    except Exception:
-        return {}

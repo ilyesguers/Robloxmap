@@ -1,11 +1,14 @@
-# 🤖 بوت تيليجرام — زيادة لايكات فري فاير (يعمل بالطريقة الحالية OB53)
+# 🤖 بوت تيليجرام — زيادة لايكات فري فاير (محدّث OB54 — يوليو 2026)
 
 بوت تيليجرام كامل (Python + aiogram 3 + aiohttp) يزيد إعجابات بروفايلات
 فري فاير (Garena) **بمجرد إدخال UID** — ينشئ **حسابات ضيف جديدة تلقائياً**
 لكل إعجاب، حتى الوصول للحد اليومي (~100 إعجاب).
 
-> ✅ الكود مبني على التدفق الشغال الحالي (OB53) — مطابق 1:1 لعميل المكتبة
-> الشغالة `@spinzaf/freefire-api` (أبريل 2026) ومستودعات `kaifcodec` (نوفمبر 2025).
+> ✅ **تحديث 2026-07-31 (OB54):** إصلاح خطأ `Token Grant فشل: {'error': 'auth_error'}`
+> نهائياً — إزالة الحسابات الجاهزة الملفَّقة + تحديث كل الروابط وصيغة الإعجاب
+> إلى الطريقة الشغالة حالياً (مطابقة لمستودع محدّث 2026-07-30 بتعليق
+> «confirmed working 2026-07-29»).
+> التفاصيل في قسم [إصلاح 2026-07-31](#-إصلاح-2026-07-31--auth_error).
 
 ---
 
@@ -59,26 +62,30 @@
 المستخدم يرسل UID فقط
       │
       ▼
-┌────────────────────────────────────────────────┐
-│ لكل إعجاب (حتى الحد اليومي ≈100):               │
-│                                                │
-│ 1) تسجيل حساب ضيف جديد:                        │
-│    POST ffmconnect.../oauth/guest/register     │
-│    (HMAC-SHA256 Signature + كلمة سر SHA256)    │
-│ 2) منح التوكن:                                 │
-│    POST .../oauth/guest/token/grant            │
-│    → access_token + open_id                    │
-│ 3) إنشاء الحساب داخل اللعبة:                   │
-│    POST loginbp.ggblueshark.com/MajorRegister  │
-│    (Protobuf + XOR + AES-128-CBC)              │
-│ 4) تسجيل الدخول → JWT:                         │
-│    POST .../MajorLogin (Protobuf + AES)        │
-│    → token + serverUrl                         │
-│ 5) إرسال الإعجاب:                              │
-│    POST {serverUrl}/LikeProfile                │
-│    (Bearer JWT + جسم AES(uid, region))         │
-│ 6) الحد اليومي؟ → إيقاف فوري + إشعار           │
-└────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│ لكل إعجاب (حتى الحد اليومي ≈100):                 │
+│                                                  │
+│ 1) تسجيل حساب ضيف جديد:                          │
+│    POST connect.garena.com/oauth/guest/register  │
+│    (+ بدائل: 100067.connect / ffmconnect)        │
+│    (HMAC-SHA256 Signature + كلمة سر SHA256)      │
+│ 2) منح التوكن:                                   │
+│    POST 100067.connect.garena.com/.../token/grant│
+│    (+ بديل v2 على ffmconnect، تراجع عند 429)     │
+│    → access_token + open_id                      │
+│ 3) إنشاء الحساب داخل اللعبة:                     │
+│    POST loginbp.ggblueshark.com/MajorRegister    │
+│    (OB54: الحقل 15 = اللغة، 17 = 1 + XOR + AES)  │
+│ 4) تسجيل الدخول → JWT:                           │
+│    POST loginbp.ggpolarbear.com/MajorLogin       │
+│    (ME أولاً على common.ggbluefox — بروتو كامل)  │
+│    → token + serverUrl + lock_region             │
+│ 5) إرسال الإعجاب — ★ الصيغة الجديدة OB54:        │
+│    POST {serverUrl}/LikeProfile                  │
+│    Bearer JWT + جسم AES(varint(uid), varint(كود  │
+│    المنطقة: ME=7, IND=1, BR=2, US=9, RU=8 ...))  │
+│ 6) الحد اليومي؟ → إيقاف فوري + إشعار             │
+└──────────────────────────────────────────────────┘
       │
       ▼
 📈 التحقق النهائي: GetPlayerPersonalShow
@@ -171,3 +178,35 @@ python tests/live_check.py    # فحص حي (شغّله من Railway — الس�
 - **أخطاء شائعة**: `MajorRegister HTTP 400` = غالباً المنطقة لا تدعم الضيف
   أو النيك نيم مكرر؛ `LIVE CHECK FAILED` = IP محظور (جرّب PROXIES) أو
   Garena غيّرت الثوابت (عدّلها من أعلى `garena.py`).
+
+## 🔧 إصلاح 2026-07-31 — `auth_error`
+
+لمن واجه: `⚠️ توقفت المهمة بعد 9 أخطاء متتالية: Token Grant فشل: {'error': 'auth_error'}`
+
+**الأسباب الحقيقية (3):**
+
+1. **حسابات جاهزة ملفَّقة** — جدول `SEED_GUEST_ACCOUNTS` كان يحتوي uid/hash
+   مختلقين غير موجودين في Garena → كل Token Grant يرد `auth_error`، والمحرك
+   يعيد اختيار نفس الحساب إلى الأبد. الحل: القائمة أصبحت **فارغة عمداً**،
+   والمخزون يمتلئ فقط بحسابات حقيقية تسجَّل بنجاح، وأي حساب يرد عليه Garena
+   بـ `auth_error` **يُحذف تلقائياً** من المخزون.
+2. **ابتلاع سبب فشل التسجيل** — كان فشل `register_guest` يُبتلع بصمت فلا
+   يظهر في السجلات سوى خطأ Token Grant اللاحق. الآن سبب فشل التسجيل يظهر في
+   السجلات **وفي رسالة تيليجرام للمستخدم** (مثلاً: IP مراكز بيانات Railway
+   مرفوض من Garena = `error_not_found`).
+3. **تقادم OB53 → OB54** — تحديث شامل:
+   - روابط MajorLogin: `ggpolarbear` (افتراضي) + `common.ggbluefox` (ME أولاً)
+     + `ggblueshark` بديل، مع تجربة تلقائية بالترتيب.
+   - Token Grant: `100067.connect.garena.com` رئيسي + بديل
+     `ffmconnect.../api/v2/oauth/guest/token:grant` + تراجع عند HTTP 429.
+   - Guest Register: `connect.garena.com` رئيسي + بديلان.
+   - **صيغة LikeProfile الجديدة**: `varint(uid) + varint(كود المنطقة)` بدل
+     النصوص (ME=7, IND=1, BR=2, SG=3, TH=4, VN=6, RU=8, US=9, BD=11, TW=12).
+   - MajorLogin يرسل بروتو OB54 الكامل (حقول 3..100) + كشف JWT بديلة بالمسح الخام.
+   - MajorRegister: الحقل 15 = لغة المنطقة + إضافة الحقل 17.
+   - `ReleaseVersion: OB54` في كل الطلبات.
+
+**ماذا تفعل الآن؟** فقط **Redeploy** على Railway بعد دمج الـ PR — لا حاجة
+لتغيير أي متغيرات. إذا رأيت في السجلات سبباً مثل `error_not_found` بعد
+التحديث فالمعنى أن Garena ترفض تسجيل ضيوف من IP مركز بيانات Railway —
+فعّل بروكسيات (`PROXIES` أو `PROXY_API_URL`) وسيعمل من أول محاولة.

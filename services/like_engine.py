@@ -236,13 +236,24 @@ class LikeEngine:
 
     # ---------------- إرسال إعجاب واحد بحساب ضيف ----------------
     async def _send_one_like(self, job: LikeJob):
-        """يحاول تسجيل حساب ضيف جديد؛ عند الفشل (مثل error_not_found 1005 من
-        سيرفر Railway) يلجأ إلى مخزون الحسابات الجاهزة (كل حساب = إعجاب واحد
-        لنفس الهدف). إذا نجح التسجيل يُحفظ الحساب الجديد في المخزون."""
+        """يحاول تسجيل حساب ضيف جديد؛ عند الفشل يلجأ إلى مخزون الحسابات
+        الحقيقية المحفوظة (كل حساب = إعجاب واحد لنفس الهدف). إذا نجح التسجيل
+        يُحفظ الحساب الجديد في المخزون.
+
+        ملاحظة مهمة: سبب فشل التسجيل يُسجَّل في السجل (logger) ولا يُبتلع —
+        كان ابتلاع الخطأ في النسخة السابقة يخفي السبب الحقيقي وراء ظهور
+        أخطاء Token Grant فقط في سجلات Railway."""
+        register_exc: Optional[Exception] = None
         try:
             guest = await self.client.register_guest(job.region)
-        except GarenaError:
-            return await self._like_from_stock(job)
+        except GarenaError as exc:
+            register_exc = exc
+            logger.warning(
+                "تعذر تسجيل ضيف جديد (%s): %s — المحاولة من مخزون الحسابات",
+                job.region,
+                exc,
+            )
+            return await self._like_from_stock(job, register_exc)
 
         # التسجيل نجح → احفظ الحساب الجديد في المخزون لاستخدامه لاحقاً
         try:
@@ -250,23 +261,37 @@ class LikeEngine:
         except Exception as exc:  # noqa: BLE001 — الفشل هنا لا يوقف الإعجاب
             logger.debug("تعذر حفظ الحساب الجديد في المخزون: %s", exc)
 
-        session = await self.client.major_login(guest.access_token, guest.open_id)
+        session = await self.client.major_login(
+            guest.access_token, guest.open_id, job.region
+        )
         result = await self.client.send_like(session, job.target_uid, job.region)
         if result.success:
             await self.db.mark_guest_used(guest.uid, job.target_uid, job.region)
         return result
 
-    async def _like_from_stock(self, job: LikeJob):
-        """يستخدم حساباً جاهزاً من المخزون لإرسال إعجاب واحد لنفس الهدف."""
+    async def _like_from_stock(self, job: LikeJob, register_exc: Optional[Exception] = None):
+        """يستخدم حساباً جاهزاً من المخزون لإرسال إعجاب واحد لنفس الهدف.
+
+        إذا ردّ Garena بـ auth_error على Token Grant (حساب غير صالح/محذوف)
+        يُحذف الحساب من المخزون تلقائياً حتى لا يتكرر نفس الخطأ إلى الأبد."""
         account = await self.db.get_available_guest(job.region, job.target_uid)
         if account is None:
-            raise GarenaError(
-                f"فشل تسجيل حساب ضيف ولا توجد حسابات جاهزة متبقية لمنطقة "
-                f"{job.region} لهذا الهدف."
-            )
+            base = f"لا توجد حسابات جاهزة متبقية لمنطقة {job.region} لهذا الهدف."
+            if register_exc is not None:
+                base += f" سبب فشل التسجيل: {register_exc}"
+            raise GarenaError(base)
         uid, password_hash = account
-        access_token, open_id = await self.client.token_grant(uid, password_hash)
-        session = await self.client.major_login(access_token, open_id)
+        try:
+            access_token, open_id = await self.client.token_grant(uid, password_hash)
+        except GarenaError as exc:
+            if "auth" in str(exc).lower():
+                try:
+                    await self.db.delete_guest_account(uid)
+                    logger.info("حُذف حساب جاهز غير صالح من المخزون: %s", uid)
+                except Exception as db_exc:  # noqa: BLE001
+                    logger.debug("تعذر حذف الحساب غير الصالح %s: %s", uid, db_exc)
+            raise
+        session = await self.client.major_login(access_token, open_id, job.region)
         result = await self.client.send_like(session, job.target_uid, job.region)
         if result.success:
             await self.db.mark_guest_used(uid, job.target_uid, job.region)
@@ -276,8 +301,10 @@ class LikeEngine:
     async def _read_likes(self, job: LikeJob) -> Optional[int]:
         try:
             guest = await self.client.register_guest(job.region)
-            session = await self.client.major_login(guest.access_token, guest.open_id)
-            info = await self.client.get_player_info(session, job.target_uid)
+            session = await self.client.major_login(
+                guest.access_token, guest.open_id, job.region
+            )
+            info = await self.client.get_player_info(session, job.target_uid, job.region)
             return info.likes if info else None
         except Exception as exc:  # noqa: BLE001
             logger.debug("تعذر قراءة عدد الإعجابات: %s", exc)
