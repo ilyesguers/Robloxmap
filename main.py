@@ -1,39 +1,74 @@
-from flask import Flask, request, jsonify
-import google.generativeai as genai
-import os
+"""
+نقطة دخول بوت تيليجرام — زيادة لايكات فري فاير
+التشغيل: python main.py
+"""
+from __future__ import annotations
 
-app = Flask(__name__)
+import asyncio
+import logging
 
-# إعداد مفتاح الذكاء الاصطناعي (ستضعه غداً في إعدادات Railway)
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-pro')
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# هذا المتغير سيحفظ الكود الذي سيأخذه ماب روبلكس
-current_luau_code = "print('السيرفر متصل، ننتظر أوامر الذكاء الاصطناعي...')"
+from config import settings
+from handlers import admin, user
+from middlewares.access_control import AccessControlMiddleware
+from services.api_client import FFAPIClient
+from services.database import Database
+from services.like_engine import LikeEngine
+from utils.logger import setup_logging
 
-@app.route('/ask-ai', methods=['POST'])
-def ask_ai():
-    global current_luau_code
-    user_prompt = request.json.get("prompt")
-    
-    # نأمر الـ AI بكتابة كود روبلكس فقط بدون أي كلام بشري
-    ai_prompt = f"اكتب كود Luau لروبلكس ينفذ هذا الطلب: {user_prompt}. اكتب الكود فقط بدون أي شرح أو علامات Markdown."
-    
+logger = logging.getLogger(__name__)
+
+
+async def main() -> None:
+    setup_logging(settings.log_level)
+
+    if not settings.is_configured:
+        raise SystemExit(
+            "⚠️ BOT_TOKEN و ADMIN_ID غير مضبوطين.\n"
+            "انسخ .env.example إلى .env واملأ القيم، أو ضعها في متغيرات البيئة."
+        )
+
+    # ---------- قاعدة البيانات ----------
+    db = Database()
+    await db.init()
+
+    # ---------- البوت ----------
+    bot = Bot(
+        token=settings.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # ---------- الخدمات المشتركة (تُحقن في المعالجات) ----------
+    api_client = FFAPIClient()
+    await api_client.start()
+    engine = LikeEngine(bot=bot, db=db, client=api_client)
+
+    dp.workflow_data.update(db=db, engine=engine)
+
+    # ---------- الوسطيات والراوترات ----------
+    dp.update.middleware(AccessControlMiddleware(db))
+    dp.include_router(user.router)
+    dp.include_router(admin.router)
+
+    # ---------- بدء محرك الإعجابات ----------
+    engine.start()
+
+    logger.info("🚀 البوت يعمل الآن... (polling)")
     try:
-        response = model.generate_content(ai_prompt)
-        # تنظيف الكود ليكون جاهزاً لروبلكس
-        clean_code = response.text.replace('```lua', '').replace('```', '')
-        current_luau_code = clean_code
-        return jsonify({"status": "success", "message": "تم توليد الكود وإرساله للماب!"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await engine.stop()
+        await api_client.close()
+        await bot.session.close()
 
-@app.route('/roblox-fetch', methods=['GET'])
-def roblox_fetch():
-    # ماب روبلكس سيدخل على هذا الرابط كل ثانية ليأخذ الكود الجديد وينفذه
-    return current_luau_code
 
-if __name__ == '__main__':
-    # تشغيل السيرفر على منفذ Railway
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.getLogger(__name__).info("تم إيقاف البوت.")
