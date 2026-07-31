@@ -59,6 +59,12 @@ class Settings:
     # ============ حدود الاستخدام ============
     rate_limit_hours: float = _get_float("RATE_LIMIT_HOURS", 1.0)
 
+    # ============ Hybrid Pool + Diagnostics (جديد) ============
+    guest_pool_size: int = _get_int("GUEST_POOL_SIZE", 3)
+    guest_pool_ttl_seconds: int = _get_int("GUEST_POOL_TTL_SECONDS", 600)
+    read_cache_ttl_seconds: int = _get_int("READ_CACHE_TTL_SECONDS", 600)
+    enable_register_fallback: bool = os.getenv("ENABLE_REGISTER_FALLBACK", "1") not in ("0", "false", "False")
+
     # ============ أخرى ============
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
