@@ -1,46 +1,29 @@
 """
-عميل Garena الحقيقي — الطريقة الشغالة الحالية (OB53).
+عميل Garena الحقيقي — الطريقة الشغالة الحالية (OB53) + تحسينات:
+- Hybrid guest pool: كاش جلسات للقراءة + تجمع مُسخَّن مسبقاً للإعجابات
+- Register fallbacks: جرّب مناطق بديلة + أسماء مستعارة بديلة عند الفشل
+- Diagnostics: عدادات تفصيلية لكل خطوة + سجل أخطاء أخير
 
-التدفق (مطابق تماماً لعميل المكتبة الشغالة @spinzaf/freefire-api — أبريل 2026):
-
-  1) تسجيل حساب ضيف جديد (Guest Register):
-     POST https://ffmconnect.live.gop.garenanow.com/oauth/guest/register
-     (form) password=SHA256(كلمة سر) & client_type=2 & source=2 & app_id=100067
-     التوقيع: HMAC-SHA256(client_secret, جسم الطلب) في header Authorization: Signature ...
-
-  2) منح توكن (Token Grant):
-     POST .../oauth/guest/token/grant  →  access_token + open_id
-
-  3) إنشاء الحساب داخل اللعبة (Major Register):
-     POST https://loginbp.ggblueshark.com/MajorRegister
-     جسم = Protobuf مشفّر AES-128-CBC (مفتاح وIV ثابتان معروفان)
-
-  4) تسجيل الدخول (Major Login) → JWT:
-     POST https://loginbp.ggblueshark.com/MajorLogin
-     جسم = Protobuf (openid=22, logintoken=29, platform=99) مشفّر AES-128-CBC
-     الرد = Protobuf → token(JWT) + serverUrl
-
-  5) إرسال الإعجاب:
-     POST {serverUrl}/LikeProfile
-     جسم = Protobuf (الهدف uid كـ string في الحقل 1، المنطقة في الحقل 2) مشفّر AES
-
-  6) التحقق من عدد الإعجابات:
-     POST {serverUrl}/GetPlayerPersonalShow → حقل liked = 21
-
-⚠️ ملاحظة أمان: كل المفاتيح والروابط هنا ثابتة في الكود حتى لا تحتاج
-أي متغيرات بيئة إضافية على Railway (يكفي BOT_TOKEN و ADMIN_ID).
-إذا غيّرت Garena هذه القيم في تحديث مستقبلي، عدّلها من أعلى هذا الملف فقط.
+التدفق الأصلي (مطابق تماماً لعميل المكتبة الشغالة @spinzaf/freefire-api — أبريل 2026):
+  1) تسجيل حساب ضيف جديد
+  2) منح توكن
+  3) إنشاء الحساب داخل اللعبة
+  4) تسجيل الدخول → JWT
+  5) إرسال الإعجاب
+  6) التحقق من عدد الإعجابات
 """
+
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import hmac
 import logging
 import random
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
@@ -51,10 +34,10 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # ==========================================================================
-# الثوابت الحقيقية — OB53 (مطابقة للعميل الشغال الحالي)
+# الثوابت الحقيقية — OB53
 # ==========================================================================
-AES_KEY = b"Yg&tc%DEuh6%Zc^8"          # مفتاح AES-128-CBC
-AES_IV = b"6oyZDr22E3ychjM%"           # IV ثابت
+AES_KEY = b"Yg&tc%DEuh6%Zc^8"
+AES_IV = b"6oyZDr22E3ychjM%"
 
 CLIENT_ID = "100067"
 CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
@@ -69,7 +52,6 @@ UA_DALVIK = "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)"
 RELEASE_VERSION = "OB53"
 X_UNITY_VERSION = "2018.4.11f1"
 
-# سيرفرات اللعبة حسب المنطقة (تُستخدم كاحتياط إذا لم يرسل MajorLogin serverUrl)
 SERVER_BASE: Dict[str, str] = {
     "IND": "https://client.ind.freefiremobile.com",
     "BR": "https://client.us.freefiremobile.com",
@@ -79,10 +61,10 @@ SERVER_BASE: Dict[str, str] = {
 }
 DEFAULT_SERVER = "https://clientbp.ggblueshark.com"
 
-# المناطق التي تدعم تسجيل الحسابات الضيفية (حسب أحدث عميل شغال)
 GUEST_REGIONS: List[str] = ["IND", "SG", "BR", "US", "RU", "TH", "VN", "TW", "ME", "CIS", "BD"]
+# ترتيب مفضل للـ fallback — يبدأ من ME ثم SG ثم البقية (الأكثر استقراراً أولاً)
+GUEST_FALLBACK_ORDER: List[str] = ["ME", "SG", "IND", "BR", "US", "RU", "TH", "VN", "TW", "BD", "CIS"]
 
-# كلمات مفتاحية تدل على وصول حد الإعجابات اليومي في ردود السيرفر
 LIMIT_KEYWORDS = (
     "limit", "daily", "reach", "max", "too many", "exceed", "full",
     "quota", "cooldown", "already", "banned", "ban", "blocked", "denied",
@@ -112,6 +94,7 @@ class GuestAccount:
     nickname: str
     access_token: str
     open_id: str
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -120,6 +103,8 @@ class LoginSession:
     server_url: str
     account_id: Optional[int] = None
     lock_region: str = ""
+    created_at: float = field(default_factory=time.time)
+    region: str = ""  # المنطقة الأصلية التي أنشئ منها
 
 
 @dataclass
@@ -136,8 +121,64 @@ class PlayerInfo:
     likes: Optional[int] = None
 
 
+@dataclass
+class Diagnostics:
+    """حاوية عدادات تشخيصية — تُحدث في كل عملية."""
+    started_at: float = field(default_factory=time.time)
+    register_attempts: int = 0
+    register_success: int = 0
+    register_failed: int = 0
+    register_per_region_attempt: Dict[str, int] = field(default_factory=lambda: collections.Counter())
+    register_per_region_success: Dict[str, int] = field(default_factory=lambda: collections.Counter())
+    register_per_region_failed: Dict[str, int] = field(default_factory=lambda: collections.Counter())
+    token_attempts: int = 0
+    token_success: int = 0
+    token_failed: int = 0
+    major_register_attempts: int = 0
+    major_register_success: int = 0
+    major_register_failed: int = 0
+    login_attempts: int = 0
+    login_success: int = 0
+    login_failed: int = 0
+    like_attempts: int = 0
+    like_success: int = 0
+    like_failed: int = 0
+    like_limit_hits: int = 0
+    read_attempts: int = 0
+    read_success: int = 0
+    read_failed: int = 0
+    pool_hits: int = 0
+    pool_miss: int = 0
+    pool_size_current: int = 0
+    last_errors: Deque[str] = field(default_factory=lambda: collections.deque(maxlen=30))
+
+    def to_dict(self) -> Dict[str, Any]:
+        uptime = int(time.time() - self.started_at)
+        return {
+            "uptime_sec": uptime,
+            "register": {
+                "attempts": self.register_attempts,
+                "success": self.register_success,
+                "failed": self.register_failed,
+                "per_region_attempt": dict(self.register_per_region_attempt),
+                "per_region_success": dict(self.register_per_region_success),
+                "per_region_failed": dict(self.register_per_region_failed),
+            },
+            "token_grant": {"attempts": self.token_attempts, "success": self.token_success, "failed": self.token_failed},
+            "major_register": {"attempts": self.major_register_attempts, "success": self.major_register_success, "failed": self.major_register_failed},
+            "login": {"attempts": self.login_attempts, "success": self.login_success, "failed": self.login_failed},
+            "like": {"attempts": self.like_attempts, "success": self.like_success, "failed": self.like_failed, "limit_hits": self.like_limit_hits},
+            "read": {"attempts": self.read_attempts, "success": self.read_success, "failed": self.read_failed},
+            "pool": {"hits": self.pool_hits, "miss": self.pool_miss, "current_size": self.pool_size_current},
+            "last_errors": list(self.last_errors),
+        }
+
+    def record_error(self, msg: str) -> None:
+        self.last_errors.append(f"{time.strftime('%H:%M:%S')} {msg[:300]}")
+
+
 # ==========================================================================
-# أدوات Protobuf (ترميز يدوي — بسيط وسريع بدون مكتبات خارجية)
+# أدوات Protobuf
 # ==========================================================================
 def _varint_encode(n: int) -> bytes:
     out = bytearray()
@@ -173,7 +214,6 @@ def _field_string(num: int, value: str) -> bytes:
 
 
 def _parse_protobuf(data: bytes) -> Dict[int, List[Any]]:
-    """فك Protobuf بسيط: كل حقل → قائمة قيمه (varint أو bytes)."""
     fields: Dict[int, List[Any]] = {}
     i = 0
     while i < len(data):
@@ -181,21 +221,21 @@ def _parse_protobuf(data: bytes) -> Dict[int, List[Any]]:
         num, wire = tag >> 3, tag & 0x07
         if num == 0:
             break
-        if wire == 0:  # varint
+        if wire == 0:
             val, i = _read_varint(data, i)
             fields.setdefault(num, []).append(val)
-        elif wire == 2:  # length-delimited
+        elif wire == 2:
             ln, i = _read_varint(data, i)
             fields.setdefault(num, []).append(data[i : i + ln])
             i += ln
-        elif wire == 5:  # 32-bit
+        elif wire == 5:
             fields.setdefault(num, []).append(data[i : i + 4])
             i += 4
-        elif wire == 1:  # 64-bit
+        elif wire == 1:
             fields.setdefault(num, []).append(data[i : i + 8])
             i += 8
         else:
-            break  # wire type غير معروف — نتوقف
+            break
     return fields
 
 
@@ -220,7 +260,6 @@ def _xor_encrypt_openid(open_id: str) -> bytes:
 
 
 def _deep_get(obj: Any, *paths: str) -> Any:
-    """يبحث عن مفتاح في JSON — سواء كان في الجذر أو داخل حقل data."""
     for path in paths:
         current = obj
         for part in path.split("."):
@@ -234,16 +273,26 @@ def _deep_get(obj: Any, *paths: str) -> Any:
 
 
 # ==========================================================================
-# العميل
+# العميل - مع Pool + Fallback + Diagnostics
 # ==========================================================================
 class GarenaClient:
-    """عميل واجهات Garena — إنشاء ضيوف، JWT، إعجابات، فحص البروفايل."""
+    """عميل واجهات Garena — مع تحسينات هجينة."""
 
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
         self._proxy_pool: List[str] = []
         self._proxy_idx: int = 0
         self._proxy_last_fetch: float = 0.0
+
+        # Diagnostics
+        self.diagnostics = Diagnostics()
+
+        # Hybrid pools
+        self._read_sessions: Dict[str, Tuple[LoginSession, float]] = {}  # region -> (session, expiry)
+        self._like_pool: Dict[str, Deque[Tuple[GuestAccount, LoginSession]]] = {}  # region -> deque
+        self._pool_lock = asyncio.Lock()
+        self._read_ttl = 600  # 10 دقائق للقراءة
+        self._like_pool_max = 5
 
     # ------------------------------------------------------------------
     # إدارة دورة الحياة
@@ -290,7 +339,6 @@ class GarenaClient:
     async def _post_form(
         self, url: str, params: Dict[str, str], headers: Dict[str, str]
     ) -> Dict[str, Any]:
-        """POST برسالة form-urlencoded ويعيد JSON."""
         assert self._session is not None
         proxy = await self._next_proxy()
         async with self._session.post(
@@ -305,7 +353,6 @@ class GarenaClient:
     async def _post_raw(
         self, url: str, body: bytes, headers: Dict[str, str]
     ) -> Tuple[int, bytes]:
-        """POST بجسم خام (octet-stream) ويعيد (الحالة، الرد)."""
         assert self._session is not None
         proxy = await self._next_proxy()
         async with self._session.post(
@@ -314,14 +361,31 @@ class GarenaClient:
             return resp.status, await resp.read()
 
     # ------------------------------------------------------------------
-    # 1) تسجيل حساب ضيف جديد كامل (register + token + major register)
+    # Diagnostics helpers
     # ------------------------------------------------------------------
-    async def register_guest(self, region: str, nickname: Optional[str] = None) -> GuestAccount:
+    def _diag_error(self, msg: str) -> None:
+        self.diagnostics.record_error(msg)
+        logger.debug("DIAG error: %s", msg)
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        # تحديث حجم التجمع الحالي
+        total = sum(len(q) for q in self._like_pool.values())
+        self.diagnostics.pool_size_current = total
+        return self.diagnostics.to_dict()
+
+    # ------------------------------------------------------------------
+    # تسجيل ضيف - محاولة واحدة لمنطقة معينة
+    # ------------------------------------------------------------------
+    async def _try_register_single_region(
+        self, region: str, nickname: Optional[str]
+    ) -> GuestAccount:
         password = str(random.randint(10**9, 10**10 - 1))
         password_hash = hashlib.sha256(password.encode()).hexdigest().upper()
-        nick = nickname or f"Liker{random.randint(1000, 9999)}"
+        nick = nickname or f"Liker{random.randint(1000, 99999)}"
 
-        # ---- 1.1 Guest Register ----
+        self.diagnostics.register_attempts += 1
+        self.diagnostics.register_per_region_attempt[region] += 1
+
         params = {
             "password": password_hash,
             "client_type": "2",
@@ -342,15 +406,27 @@ class GarenaClient:
         data = resp.get("json", {})
         uid = _deep_get(data, "uid", "data.uid")
         if not uid or resp.get("status", 0) != 200:
+            err_txt = str(resp.get("raw") or data)[:250]
+            self.diagnostics.register_failed += 1
+            self.diagnostics.register_per_region_failed[region] += 1
+            self._diag_error(f"GuestRegister fail region={region} status={resp.get('status')} err={err_txt}")
             raise GarenaError(
-                f"فشل تسجيل حساب ضيف ({region}): {str(resp.get('raw') or data)[:200]}"
+                f"فشل تسجيل حساب ضيف ({region}): {err_txt}"
             )
         uid = str(uid)
 
-        # ---- 1.2 Token Grant ----
-        access_token, open_id = await self.token_grant(uid, password_hash)
+        # Token Grant
+        self.diagnostics.token_attempts += 1
+        try:
+            access_token, open_id = await self.token_grant(uid, password_hash)
+            self.diagnostics.token_success += 1
+        except Exception as e:
+            self.diagnostics.token_failed += 1
+            self._diag_error(f"TokenGrant fail uid={uid} region={region}: {e}")
+            raise
 
-        # ---- 1.3 Major Register (إنشاء الحساب كاملاً: nickname + region) ----
+        # Major Register
+        self.diagnostics.major_register_attempts += 1
         body = (
             _field_string(1, nick)
             + _field_string(2, access_token)
@@ -377,7 +453,12 @@ class GarenaClient:
         }
         status, _resp_body = await self._post_raw(URL_MAJOR_REGISTER, enc, reg_headers)
         if status != 200:
-            raise GarenaError(f"MajorRegister فشل (HTTP {status})")
+            self.diagnostics.major_register_failed += 1
+            self._diag_error(f"MajorRegister HTTP {status} region={region} uid={uid}")
+            raise GarenaError(f"MajorRegister فشل (HTTP {status}) منطقة {region}")
+        self.diagnostics.major_register_success += 1
+        self.diagnostics.register_success += 1
+        self.diagnostics.register_per_region_success[region] += 1
 
         logger.info("تم إنشاء حساب ضيف جديد %s (منطقة %s)", uid, region)
         return GuestAccount(
@@ -391,7 +472,67 @@ class GarenaClient:
         )
 
     # ------------------------------------------------------------------
-    # 2) منح التوكن (لحساب ضيف موجود)
+    # 1) تسجيل حساب ضيف جديد كامل — مع fallback
+    # ------------------------------------------------------------------
+    async def register_guest(
+        self, region: str, nickname: Optional[str] = None, fallback: bool = True
+    ) -> GuestAccount:
+        """
+        يسجّل حساب ضيف جديد. إذا فشل للمنطقة المطلوبة و fallback=True،
+        يجرّب مناطق أخرى من GUEST_FALLBACK_ORDER، مع 3 محاولات بأسماء مختلفة لكل منطقة.
+        """
+        region = region.upper()
+        regions_to_try: List[str] = [region]
+        if fallback:
+            # أضف باقي المناطق حسب الترتيب المفضل بدون تكرار
+            for r in GUEST_FALLBACK_ORDER:
+                if r != region and r not in regions_to_try:
+                    regions_to_try.append(r)
+            # أضف أي مناطق أخرى مفقودة
+            for r in GUEST_REGIONS:
+                if r not in regions_to_try:
+                    regions_to_try.append(r)
+
+        last_exc: Optional[Exception] = None
+        attempted: List[str] = []
+
+        for reg in regions_to_try:
+            attempted.append(reg)
+            # جرّب 3 أسماء مختلفة لنفس المنطقة (لتجاوز تضارب الاسم)
+            for nick_try in range(3):
+                try_nick = None
+                if nick_try == 0 and nickname:
+                    try_nick = nickname
+                else:
+                    try_nick = f"Liker{random.randint(1000, 99999)}_{random.randint(10,99)}"
+
+                try:
+                    return await self._try_register_single_region(reg, try_nick)
+                except GarenaError as e:
+                    last_exc = e
+                    err_str = str(e).lower()
+                    # إذا الخطأ يوحي بمشكلة اسم، جرّب اسماً آخر لنفس المنطقة
+                    if any(k in err_str for k in ["nickname", "name", "duplicate", "exist", "400"]):
+                        logger.debug("Retry nickname for region %s attempt %s", reg, nick_try)
+                        await asyncio.sleep(0.3)
+                        continue
+                    else:
+                        # خطأ منطقة — انتقل للمنطقة التالية
+                        logger.debug("Region %s failed, fallback to next: %s", reg, e)
+                        break
+                except Exception as e:  # noqa: BLE001
+                    last_exc = e
+                    logger.debug("Unexpected register failure region %s: %s", reg, e)
+                    break
+
+        # كل المحاولات فشلت
+        aggregate = ", ".join(attempted)
+        msg = f"فشل إنشاء حساب ضيف بعد تجربة المناطق [{aggregate}]: {last_exc}"
+        self._diag_error(msg)
+        raise GarenaError(msg)
+
+    # ------------------------------------------------------------------
+    # 2) منح التوكن
     # ------------------------------------------------------------------
     async def token_grant(self, uid: str, password_hash: str) -> Tuple[str, str]:
         params = {
@@ -418,9 +559,10 @@ class GarenaClient:
         return str(access_token), str(open_id)
 
     # ------------------------------------------------------------------
-    # 3) تسجيل الدخول (Major Login) → JWT + serverUrl
+    # 3) تسجيل الدخول → JWT
     # ------------------------------------------------------------------
     async def major_login(self, access_token: str, open_id: str) -> LoginSession:
+        self.diagnostics.login_attempts += 1
         body = (
             _field_string(22, open_id)
             + _field_string(29, access_token)
@@ -440,13 +582,18 @@ class GarenaClient:
         }
         status, raw = await self._post_raw(URL_MAJOR_LOGIN, enc, headers)
         if status != 200:
+            self.diagnostics.login_failed += 1
+            self._diag_error(f"MajorLogin HTTP {status}: {raw[:120]!r}")
             raise GarenaError(f"MajorLogin فشل (HTTP {status}): {raw[:100]!r}")
 
         fields = _parse_protobuf(raw)
         jwt = _bytes_to_str(fields.get(8, [None])[0])
         if not jwt:
+            self.diagnostics.login_failed += 1
+            self._diag_error("MajorLogin no JWT in response")
             raise GarenaError("MajorLogin لم يعد JWT — الاستجابة غير متوقعة")
 
+        self.diagnostics.login_success += 1
         server_url = _bytes_to_str(fields.get(10, [None])[0]) or self._base_server()
         account_id = next((v for v in fields.get(1, []) if isinstance(v, int)), None)
         lock_region = _bytes_to_str(fields.get(2, [None])[0]) or ""
@@ -455,11 +602,95 @@ class GarenaClient:
         )
 
     # ------------------------------------------------------------------
+    # Hybrid Pool - Read cache
+    # ------------------------------------------------------------------
+    async def get_read_session(self, region: str) -> LoginSession:
+        """يعيد جلسة صالحة للقراءة (كاش 10 دقائق — hybrid pool)."""
+        self.diagnostics.read_attempts += 1
+        now = time.time()
+        async with self._pool_lock:
+            if region in self._read_sessions:
+                sess, expiry = self._read_sessions[region]
+                if now < expiry:
+                    self.diagnostics.pool_hits += 1
+                    self.diagnostics.read_success += 1
+                    return sess
+
+        self.diagnostics.pool_miss += 1
+        try:
+            guest = await self.register_guest(region, fallback=True)
+            sess = await self.major_login(guest.access_token, guest.open_id)
+            sess.region = region
+            async with self._pool_lock:
+                self._read_sessions[region] = (sess, now + self._read_ttl)
+            self.diagnostics.read_success += 1
+            return sess
+        except Exception as e:
+            self.diagnostics.read_failed += 1
+            self._diag_error(f"get_read_session fail region={region}: {e}")
+            raise
+
+    # ------------------------------------------------------------------
+    # Hybrid Pool - Like sessions (pre-warmed)
+    # ------------------------------------------------------------------
+    async def get_like_session(self, region: str) -> Tuple[GuestAccount, LoginSession]:
+        """Hybrid: أولاً جرّب تجمع مُسخّن، وإلا أنشئ حساباً جديداً."""
+        async with self._pool_lock:
+            q = self._like_pool.get(region)
+            if q and len(q) > 0:
+                self.diagnostics.pool_hits += 1
+                guest, sess = q.popleft()
+                # تحقق صلاحية JWT (بسيط: لم يمضِ أكثر من 25 دقيقة)
+                if time.time() - sess.created_at < 1500:
+                    return guest, sess
+                # منتهي — استمر لإنشاء جديد
+            self.diagnostics.pool_miss += 1
+
+        # إنشاء جديد (مع fallback)
+        guest = await self.register_guest(region, fallback=True)
+        sess = await self.major_login(guest.access_token, guest.open_id)
+        sess.region = guest.region  # قد تكون منطقة بديلة
+        sess.created_at = time.time()
+        return guest, sess
+
+    async def prewarm_like_pool(self, region: str, count: int = 2) -> int:
+        """يملأ التجمع مسبقاً بـ count جلسات — يُستدعى في الخلفية."""
+        filled = 0
+        async with self._pool_lock:
+            q = self._like_pool.setdefault(region, collections.deque(maxlen=self._like_pool_max))
+            need = max(0, count - len(q))
+        for _ in range(need):
+            try:
+                guest = await self.register_guest(region, fallback=True)
+                sess = await self.major_login(guest.access_token, guest.open_id)
+                sess.region = guest.region
+                async with self._pool_lock:
+                    if len(q) < self._like_pool_max:
+                        q.append((guest, sess))
+                        filled += 1
+            except Exception as e:  # noqa: BLE001
+                logger.debug("prewarm_like_pool fail region=%s: %s", region, e)
+                break
+        return filled
+
+    def clear_pool(self, region: Optional[str] = None) -> int:
+        """يمسح التجمع (للتشخيص أو بعد أخطاء)."""
+        if region:
+            q = self._like_pool.pop(region, None)
+            self._read_sessions.pop(region, None)
+            return len(q) if q else 0
+        total = sum(len(q) for q in self._like_pool.values())
+        self._like_pool.clear()
+        self._read_sessions.clear()
+        return total
+
+    # ------------------------------------------------------------------
     # 4) إرسال الإعجاب
     # ------------------------------------------------------------------
     async def send_like(
         self, session: LoginSession, target_uid: str, region: str
     ) -> LikeResult:
+        self.diagnostics.like_attempts += 1
         body = _field_string(1, str(target_uid)) + _field_string(2, region)
         enc = _aes_encrypt(body)
         headers = {
@@ -477,19 +708,23 @@ class GarenaClient:
         status, raw = await self._post_raw(url, enc, headers)
 
         if status == 200:
+            self.diagnostics.like_success += 1
             return LikeResult(success=True)
 
         text = raw.decode("utf-8", errors="ignore").lower()
         if any(k in text for k in LIMIT_KEYWORDS) or status in (403, 429):
+            self.diagnostics.like_limit_hits += 1
             return LikeResult(
                 success=False,
                 limit_reached=True,
                 message=f"HTTP {status}: {text[:120]}",
             )
+        self.diagnostics.like_failed += 1
+        self._diag_error(f"Like fail HTTP {status} uid={target_uid} region={region}: {text[:120]}")
         return LikeResult(success=False, message=f"HTTP {status}: {text[:120]}")
 
     # ------------------------------------------------------------------
-    # 5) جلب معلومات اللاعب (للتحقق من أن عدد الإعجابات زاد فعلاً)
+    # 5) جلب معلومات اللاعب
     # ------------------------------------------------------------------
     async def get_player_info(
         self, session: LoginSession, uid: str
@@ -519,7 +754,6 @@ class GarenaClient:
 
     @staticmethod
     def _extract_player_info(raw: bytes) -> Tuple[Optional[int], Optional[str]]:
-        """يبحث في الـ protobuf عن حقل liked (21) و nickname (3) مهما كان التداخل."""
         liked: Optional[int] = None
         nickname: Optional[str] = None
 
@@ -545,8 +779,6 @@ class GarenaClient:
             return None, None
         return liked, nickname
 
-    # ------------------------------------------------------------------
-    # مساعدات
     # ------------------------------------------------------------------
     def _base_server(self, region: Optional[str] = None) -> str:
         if region:
