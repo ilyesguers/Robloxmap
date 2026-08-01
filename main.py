@@ -27,9 +27,16 @@ async def main() -> None:
     setup_logging(settings.log_level)
 
     if not settings.is_configured:
+        missing = []
+        if not settings.bot_token:
+            missing.append("BOT_TOKEN")
+        if settings.admin_id == 0:
+            missing.append("ADMIN_ID")
+        if not settings.database_url:
+            missing.append("DATABASE_URL")
         raise SystemExit(
-            "⚠️ BOT_TOKEN و ADMIN_ID غير مضبوطين.\n"
-            "انسخ .env.example إلى .env واملأ القيم، أو ضعها في متغيرات البيئة."
+            f"⚠️ متغيرات بيئة ناقصة: {', '.join(missing)}\n"
+            "أضفها في متغيرات البيئة على Railway."
         )
 
     # ---------- قاعدة البيانات ----------
@@ -64,6 +71,7 @@ async def main() -> None:
     finally:
         await engine.stop()
         await api_client.close()
+        await db.close()
         await bot.session.close()
 
 

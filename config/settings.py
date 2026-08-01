@@ -39,7 +39,7 @@ class Settings:
     admin_id: int = _get_int("ADMIN_ID", 0)
 
     # ============ قاعدة البيانات ============
-    db_path: str = os.getenv("DB_PATH", "data/bot.db")
+    database_url: str = os.getenv("DATABASE_URL", "")
 
     # ============ منطق الإعجابات (اختياري) ============
     max_likes_per_session: int = _get_int("MAX_LIKES_PER_SESSION", 100)
@@ -68,7 +68,7 @@ class Settings:
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.bot_token) and self.admin_id != 0
+        return bool(self.bot_token) and self.admin_id != 0 and bool(self.database_url)
 
 
 settings = Settings()

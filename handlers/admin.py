@@ -1,4 +1,5 @@
-"""لوحة تحكم الأدمن: /stats، /broadcast، /ban، /unban، /queue، /clear_queue.
+"""لوحة تحكم الأدمن: /stats، /broadcast، /ban، /unban، /queue، /clear_queue،
+/stock، /tokens، /refresh_tokens.
 
 كل هذه الأوامر تعمل فقط لصاحب البوت (ADMIN_ID من متغيرات البيئة).
 """
@@ -13,6 +14,7 @@ from aiogram.types import Message
 
 from config import settings
 from services.database import Database
+from services.garena import GarenaClient, GarenaError
 from services.like_engine import LikeEngine
 
 router = Router(name="admin")
@@ -24,6 +26,10 @@ router.message.filter(F.from_user.id == settings.admin_id)
 @router.message(Command("stats"))
 async def admin_stats(message: Message, db: Database, engine: LikeEngine) -> None:
     s = await db.get_stats()
+    stock_by_region = await db.guest_stock_by_region()
+    stock_lines = "\n".join(
+        f"  • {region}: {count}" for region, count in stock_by_region.items()
+    ) or "  (فارغ)"
     await message.answer(
         "📊 <b>إحصائيات البوت:</b>\n"
         f"👥 إجمالي المستخدمين: {s['total_users']}\n"
@@ -32,7 +38,8 @@ async def admin_stats(message: Message, db: Database, engine: LikeEngine) -> Non
         f"❤️ إجمالي الإعجابات المرسلة: {s['total_likes']}\n"
         f"⛔ محظورون: {s['banned']}\n"
         f"🔄 قائمة الانتظار: {engine.queue_size}\n"
-        f"⚙️ مهام نشطة الآن: {engine.active_count}"
+        f"⚙️ مهام نشطة الآن: {engine.active_count}\n\n"
+        f"📦 <b>مخزون الحسابات:</b>\n{stock_lines}"
     )
 
 
@@ -109,3 +116,184 @@ async def admin_queue(message: Message, engine: LikeEngine) -> None:
 async def admin_clear_queue(message: Message, engine: LikeEngine) -> None:
     cleared = engine.clear_queue()
     await message.answer(f"🗑️ تم مسح {cleared} مهمة من قائمة الانتظار.")
+
+
+# ========================================================
+# أوامر جديدة: مخزون الحسابات والتوكنات
+# ========================================================
+
+
+@router.message(Command("stock"))
+async def admin_stock(message: Message, db: Database, command: CommandObject) -> None:
+    """يعرض حالة مخزون الحسابات لكل منطقة."""
+    region = command.args.strip().upper() if command.args else None
+
+    if region:
+        count = await db.guest_stock_count(region)
+        await message.answer(f"📦 مخزون حسابات منطقة {region}: <b>{count}</b> حساب")
+        return
+
+    stock_by_region = await db.guest_stock_by_region()
+    total = await db.guest_stock_count()
+    if not stock_by_region:
+        await message.answer("📦 المخزون فارغ حالياً.")
+        return
+
+    lines = [f"📦 <b>مخزون الحسابات ({total} إجمالي):</b>"]
+    for region, count in stock_by_region.items():
+        lines.append(f"  • {region}: {count} حساب")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("tokens"))
+async def admin_tokens(message: Message, db: Database, command: CommandObject) -> None:
+    """يعرض بيانات الحسابات والتوكنات — للأدمن فقط.
+
+    الاستخدام:
+      /tokens          — أول 10 حسابات
+      /tokens <N>      — أول N حسابات
+      /tokens <region> — حسابات منطقة محددة
+    """
+    args = command.args.strip() if command.args else ""
+
+    # تحديد المنطقة
+    region = None
+    limit = 10
+    if args:
+        upper = args.upper()
+        if upper.isdigit():
+            limit = min(int(upper), 50)
+        elif len(upper) <= 4:
+            region = upper
+            limit = 50
+        else:
+            limit = min(int(args), 50)
+
+    if region:
+        accounts = await db.get_accounts_by_region(region)
+        header = f"🔑 <b>حسابات منطقة {region}:</b>\n"
+    else:
+        accounts = await db.get_accounts_for_token_grant(limit)
+        header = f"🔑 <b>أول {len(accounts)} حسابات:</b>\n"
+
+    if not accounts:
+        await message.answer("📦 لا توجد حسابات في المخزون.")
+        return
+
+    lines = [header]
+    for i, acc in enumerate(accounts[:limit], 1):
+        token_preview = acc["access_token"][:20] + "..." if acc.get("access_token") else "❌ لا يوجد"
+        lines.append(
+            f"<b>{i}.</b> UID: <code>{acc['account_uid']}</code> | "
+            f"Region: {acc['region']} | "
+            f"Nick: {acc.get('nickname', '—')}\n"
+            f"   Password: <code>{acc.get('password', '—')}</code>\n"
+            f"   Token: <code>{token_preview}</code>\n"
+            f"   OpenID: <code>{acc.get('open_id', '—')[:20]}...</code>"
+        )
+
+    text = "\n".join(lines)
+    # تقسيم الرسالة إذا كانت طويلة
+    if len(text) > 4000:
+        for chunk_start in range(0, len(text), 4000):
+            chunk = text[chunk_start:chunk_start + 4000]
+            await message.answer(chunk)
+    else:
+        await message.answer(text)
+
+
+@router.message(Command("refresh_tokens"))
+async def admin_refresh_tokens(
+    message: Message, db: Database, client: GarenaClient, command: CommandObject
+) -> None:
+    """يحدّث التوكنات لكل الحسابات في المخزون — يحصل على access_token جديد لكل حساب.
+
+    الاستخدام:
+      /refresh_tokens          — أول 20 حساب
+      /refresh_tokens <N>      — أول N حسابات
+    """
+    args = command.args.strip() if command.args else ""
+    limit = 20
+    if args and args.isdigit():
+        limit = min(int(args), 100)
+
+    accounts = await db.get_accounts_for_token_grant(limit)
+    if not accounts:
+        await message.answer("📦 لا توجد حسابات في المخزون.")
+        return
+
+    status_msg = await message.answer(
+        f"🔄 جاري تحديث التوكنات لـ {len(accounts)} حساب..."
+    )
+
+    ok = 0
+    fail = 0
+    for acc in accounts:
+        uid = acc["account_uid"]
+        password_hash = acc["password_hash"]
+        try:
+            access_token, open_id = await client.token_grant(uid, password_hash)
+            await db.update_account_token(uid, access_token, open_id)
+            ok += 1
+        except GarenaError as exc:
+            fail += 1
+            # حذف الحساب غير الصالح
+            if "auth" in str(exc).lower():
+                await db.delete_guest_account(uid)
+                logger.info("حُذف حساب غير صالح أثناء تحديث التوكنات: %s", uid)
+            else:
+                logger.warning("فشل تحديث توكن %s: %s", uid, exc)
+        except Exception as exc:  # noqa: BLE001
+            fail += 1
+            logger.warning("خطأ أثناء تحديث توكن %s: %s", uid, exc)
+        # تأخير بسيط لتجنب rate limit
+        await asyncio.sleep(1)
+
+    await status_msg.edit_text(
+        f"✅ <b>انتهى تحديث التوكنات:</b>\n"
+        f"🟢 نجح: {ok}\n"
+        f"🔴 فشل: {fail}\n"
+        f"📦 إجمالي: {len(accounts)}"
+    )
+
+
+@router.message(Command("export_accounts"))
+async def admin_export_accounts(message: Message, db: Database, command: CommandObject) -> None:
+    """يصدّر بيانات الحسابات كاملة — للأدمن فقط.
+
+    الاستخدام:
+      /export_accounts          — كل الحسابات
+      /export_accounts <region> — حسابات منطقة محددة
+    """
+    args = command.args.strip() if command.args else ""
+    region = args.upper() if args else None
+
+    if region:
+        accounts = await db.get_accounts_by_region(region)
+        header = f"📋 <b>تصدير حسابات {region}:</b>\n\n"
+    else:
+        accounts = await db.get_all_accounts()
+        header = f"📋 <b>تصدير كل الحسابات:</b>\n\n"
+
+    if not accounts:
+        await message.answer("📦 لا توجد حسابات.")
+        return
+
+    lines = [header]
+    for i, acc in enumerate(accounts, 1):
+        lines.append(
+            f"{i}. UID: <code>{acc['account_uid']}</code>\n"
+            f"   Password: <code>{acc.get('password', '—')}</code>\n"
+            f"   PasswordHash: <code>{acc['password_hash']}</code>\n"
+            f"   AccessToken: <code>{acc.get('access_token', '—')}</code>\n"
+            f"   OpenID: <code>{acc.get('open_id', '—')}</code>\n"
+            f"   Region: {acc['region']} | Nick: {acc.get('nickname', '—')}"
+        )
+
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        for chunk_start in range(0, len(text), 4000):
+            chunk = text[chunk_start:chunk_start + 4000]
+            await message.answer(chunk)
+    else:
+        await message.answer(text)
