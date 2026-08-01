@@ -53,6 +53,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❤️ إرسال لايكات (UID)", callback_data="start_like")],
             [InlineKeyboardButton(text="🔍 بحث بالاسم", callback_data="search_name")],
             [InlineKeyboardButton(text="🤝 مساهمة بحساب (donate)", callback_data="donate")],
+            [InlineKeyboardButton(text="🆕 حساب ضيف جديد", callback_data="new_guest")],
             [InlineKeyboardButton(text="📊 إحصائياتي", callback_data="my_stats")],
             [InlineKeyboardButton(text="ℹ️ المساعدة", callback_data="help")],
         ]
@@ -129,6 +130,33 @@ async def cmd_likes(
 async def cmd_donate(message: Message, state: FSMContext) -> None:
     await state.set_state(DonateFlow.waiting_lines)
     await message.answer(_donate_instructions())
+
+
+@router.message(Command("newguest"))
+async def cmd_newguest(message: Message, engine: LikeEngine) -> None:
+    """يصنع حساب ضيف جديد بكلمة سر معروفة — ليستوردها المستخدم إلى
+    هاتفه/محاكيه، يلعب بها حتى المستوى 8، ثم يعيدها عبر /donate."""
+    status = await message.answer("⏳ جاري إنشاء حساب ضيف جديد...")
+    region = "ME"
+    try:
+        guest = await engine.client.register_guest(region)
+    except Exception as exc:  # noqa: BLE001
+        await status.edit_text(
+            f"❌ تعذّر إنشاء حساب الآن: {str(exc)[:150]}\n"
+            "(غالباً IP السيرفر مرفوض — حاول لاحقاً أو فعّل البروكسيات)"
+        )
+        return
+    await status.edit_text(
+        "✅ <b>حساب ضيف جديد جاهز:</b>\n\n"
+        f"UID: <code>{guest.uid}</code>\n"
+        f"كلمة السر: <code>{guest.password}</code>\n"
+        f"السيرفر: {guest.region}\n\n"
+        "<b>خطواتك الآن:</b>\n"
+        f"1️⃣ سجّل دخول هذا الحساب في اللعبة (محاكٍ/أداة استيراد ضيف بالـ UID + كلمة السر)\n"
+        f"2️⃣ العب به حتى المستوى {settings.min_donor_level}+ (~3 مباريات)\n"
+        f"3️⃣ أرسل /donate ثم: <code>{guest.uid}:{guest.password}</code>\n\n"
+        "⚠️ احتفظ بالبيانات — ولا تربط الحساب بحسابك الشخصي."
+    )
 
 
 @router.message(Command("cancel"))
@@ -290,6 +318,12 @@ async def on_donate_button(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(DonateFlow.waiting_lines)
     await callback.message.answer(_donate_instructions())
+
+
+@router.callback_query(F.data == "new_guest")
+async def on_new_guest_button(callback: CallbackQuery, engine: LikeEngine) -> None:
+    await callback.answer()
+    await cmd_newguest(callback.message, engine)
 
 
 @router.message(DonateFlow.waiting_lines)
