@@ -1,39 +1,56 @@
-"""محرك الإعجابات: صف انتظار + عامل غير متزامن.
+"""محرك الإعجابات — بنية أغسطس 2026 (بعد بوابة المستوى OB51+).
 
-لكل إعجاب:
-  1) إنشاء حساب ضيف جديد كامل (تسجيل + توكن + إنشاء داخل اللعبة) ← حساب وهمي جديد
-  2) تسجيل دخول → JWT
-  3) إرسال الإعجاب للـ UID المستهدف
-  4) عند الوصول للحد اليومي → إيقاف فوري + إشعار المستخدم
+★ الفرق الجوهري عن النسخة السابقة:
+  النسخة القديمة كانت تنشئ حساباً ضيفاً (مستوى 1) لكل إعجاب — ومنذ OB51
+  (أبريل 2026) تتجاهل Garena إعجابات الحسابات دون المستوى 8 صامتاً، لذا
+  كانت اللايكات «تُرسل» ولا «تُحتسب» أبداً في اللعبة.
 
-نظام التبادل:
-  - كل حساب يُحفظ في قاعدة البيانات مع كل بياناته (uid, password, access_token, open_id)
-  - أي مستخدم يطلب إعجاب يمكنه الاستفادة من حسابات أنشأها مستخدمون آخرون
-  - كل حساب يُستخدم مرة واحدة فقط لكل هدف (account_uid + target_uid)
+  الآن:
+    • الإعجابات تُرسل فقط من «مخزون حسابات حقيقية مساهَم بها» موثَّقة
+      (token grant + login حقيقي + مستوى مقروء من البروفايل ≥ MIN_DONOR_LEVEL).
+    • منطقة الهدف تُكتشف تلقائياً (لا يختارها المستخدم بعد الآن).
+    • التحقق الحي أثناء الإرسال: نقرأ العداد كل عدة إعجابات، ونتوقف مبكراً
+      إذا تجاهلت Garena الدفعة (مثلاً: تجاوز سقف ~20 إعجاباً من مرسلين 8-20).
+    • الرقم النهائي المعروض = ما زاد فعلاً في عداد اللعبة، لا ما أُرسل.
+
+  الحسابات الضيفية الجديدة تُستخدم فقط كـ«جلسات قارئة» (كشف منطقة/عداد/بحث).
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import random
+import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from aiogram import Bot
 
 from config import settings
 from services.database import Database
-from services.garena import DailyLimitError, GarenaClient, GarenaError
+from services.garena import (
+    AccountBannedError,
+    DailyLimitError,
+    GarenaClient,
+    GarenaError,
+    LoginSession,
+    PlayerInfo,
+)
 
 logger = logging.getLogger(__name__)
+
+# أولوية تجربة المناطق عند كشف منطقة الهدف (الأكثر شيوعاً أولاً)
+REGION_PROBE_ORDER: List[str] = [
+    "ME", "IND", "BR", "SG", "BD", "US", "RU", "TH", "VN", "TW", "CIS",
+]
 
 
 @dataclass
 class LikeJob:
     user_id: int
     target_uid: str
-    region: str
+    region: str = ""           # فارغ = كشف تلقائي
+    target_name: str = ""      # للعرض فقط (عند اختيار الهدف من البحث)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -51,6 +68,9 @@ class LikeEngine:
         self.queue: asyncio.Queue[LikeJob] = asyncio.Queue()
         self._active: Dict[int, LikeJob] = {}
         self._task: Optional[asyncio.Task] = None
+        # جلسات قارئة مؤقتة لكل منطقة: region → (انتهاء الصلاحية, الجلسة)
+        self._readers: Dict[str, Tuple[float, LoginSession]] = {}
+        self._reader_lock = asyncio.Lock()
 
     # ---------------- إدارة دورة الحياة ----------------
     def start(self) -> None:
@@ -90,6 +110,86 @@ class LikeEngine:
     def active_count(self) -> int:
         return len(self._active)
 
+    # ---------------- جلسات القراءة (كشف المنطقة/العداد/البحث) ----------------
+    async def reader_session(self, region: str) -> LoginSession:
+        """جلسة قراءة لمنطقة معيّنة: أولاً من مخزون الحسابات الموثقة (أي
+        مستوى — القراءة لا تتطلب مستوى)، وإلا حساب ضيف جديد للقراءة فقط."""
+        region = region.upper()
+        now = time.time()
+        cached = self._readers.get(region)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        async with self._reader_lock:
+            cached = self._readers.get(region)
+            if cached and cached[0] > now:
+                return cached[1]
+
+            session: Optional[LoginSession] = None
+            # 1) حساب مساهَم به من نفس المنطقة (لا يُستهلك — مجرد دخول/قراءة)
+            try:
+                pool_acc = await self._any_pool_account(region)
+                if pool_acc is not None:
+                    uid, password_hash = pool_acc
+                    access_token, open_id = await self.client.token_grant(uid, password_hash)
+                    session = await self.client.major_login(access_token, open_id, region)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("قارئة من المخزون (%s) فشلت: %s", region, exc)
+                session = None
+
+            # 2) ضيف جديد للقراءة فقط
+            if session is None:
+                guest = await self.client.register_guest(region)
+                session = await self.client.major_login(
+                    guest.access_token, guest.open_id, region
+                )
+
+            self._readers[region] = (now + settings.reader_session_ttl, session)
+            return session
+
+    async def _any_pool_account(self, region: str) -> Optional[Tuple[str, str]]:
+        row = await self.db.get_any_account_for_read(region)
+        return row
+
+    async def detect_region(self, target_uid: str) -> Tuple[str, Optional[PlayerInfo]]:
+        """يكتشف منطقة الهدف تلقائياً بالبحث في سيرفرات المناطق بالترتيب.
+        يعيد (المنطقة, معلومات اللاعب) أو يرفع GarenaError."""
+        last_err = "بدون رد"
+        for region in REGION_PROBE_ORDER:
+            try:
+                session = await self.reader_session(region)
+            except Exception as exc:  # noqa: BLE001
+                last_err = f"{region}: {exc}"
+                logger.debug("تعذرت جلسة قراءة %s أثناء كشف المنطقة: %s", region, exc)
+                continue
+            try:
+                info = await self.client.get_player_info(session, target_uid, region)
+            except Exception as exc:  # noqa: BLE001
+                info = None
+                logger.debug("قراءة اللاعب %s على %s فشلت: %s", target_uid, region, exc)
+            if info and (info.nickname or info.likes is not None):
+                return region, info
+        raise GarenaError(
+            f"تعذّر العثور على الحساب {target_uid} في أي سيرفر ({last_err}). "
+            "تأكد من صحة الـ UID وأن الحساب نشط."
+        )
+
+    async def read_target_info(
+        self, region: str, target_uid: str
+    ) -> Optional[PlayerInfo]:
+        try:
+            session = await self.reader_session(region)
+            return await self.client.get_player_info(session, target_uid, region)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("تعذّرت قراءة معلومات الهدف: %s", exc)
+            return None
+
+    async def search_players(
+        self, region: str, keyword: str, limit: int = 8
+    ) -> List[PlayerInfo]:
+        session = await self.reader_session(region)
+        return await self.client.search_accounts(session, keyword, region, limit)
+
     # ---------------- حلقة العمل ----------------
     async def _run(self) -> None:
         while True:
@@ -108,128 +208,219 @@ class LikeEngine:
 
     # ---------------- المعالجة ----------------
     async def _process(self, job: LikeJob) -> None:
+        label = f"<code>{job.target_uid}</code>"
+        if job.target_name:
+            label = f"<b>{job.target_name}</b> (<code>{job.target_uid}</code>)"
+
+        # ---- المرحلة 1: كشف المنطقة تلقائياً + قراءة العداد الحالي ----
+        await self._safe_send(job.user_id, f"🔎 جاري تحديد سيرفر الحساب {label} ...")
+        before: Optional[int] = None
+        target_info: Optional[PlayerInfo] = None
+        if job.region:
+            region = job.region
+            target_info = await self.read_target_info(region, job.target_uid)
+            if target_info is None:
+                await self._safe_send(
+                    job.user_id,
+                    "❌ تعذّر العثور على هذا الحساب في السيرفر المحدد.\n"
+                    "جرّب بدون تحديد سيرفر وسأكتشفه تلقائياً.",
+                )
+                return
+        else:
+            try:
+                region, target_info = await self.detect_region(job.target_uid)
+            except GarenaError as exc:
+                await self._safe_send(job.user_id, f"❌ {exc}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                await self._safe_send(job.user_id, f"❌ فشل كشف المنطقة: {exc}")
+                return
+
+        job.region = region
+        name = (target_info.nickname if target_info else None) or job.target_name or "بدون اسم"
+        before = target_info.likes if target_info else None
         await self._safe_send(
             job.user_id,
-            "🚀 بدأ إرسال الإعجابات إلى UID <code>{}</code> (السيرفر: {})\n"
-            "👤 سيتم إنشاء <b>حساب ضيف جديد</b> لكل إعجاب.\n"
-            "🎯 الحد الأقصى لهذه الجلسة: {} إعجاب.".format(
-                job.target_uid, job.region, settings.max_likes_per_session
-            ),
+            "✅ تم العثور على الحساب:\n"
+            f"👤 الاسم: <b>{name}</b>\n"
+            f"🌍 السيرفر: <b>{region}</b>"
+            + (f"\n⭐ المستوى: {target_info.level}" if target_info and target_info.level is not None else "")
+            + (f"\n❤️ اللايكات الحالية: <b>{before}</b>" if before is not None else ""),
         )
 
-        # ---- قراءة عدد الإعجابات الحالي (للتحقق بعد الانتهاء) ----
-        before = await self._read_likes(job)
-        if before is not None:
+        # ---- المرحلة 2: فحص المخزون المتاح لهذا الهدف ----
+        available = await self.db.count_available(region, job.target_uid)
+        if available <= 0:
+            lvl = settings.min_donor_level
             await self._safe_send(
-                job.user_id, f"📊 عدد إعجابات الهدف حالياً: <b>{before}</b>"
+                job.user_id,
+                "😞 <b>المخزون فارغ حالياً لهذا السيرفر.</b>\n\n"
+                f"منذ تحديث OB51 لا تُحتسب اللايكات إلا من حسابات حقيقية بمستوى <b>{lvl}+</b> —\n"
+                "الحسابات الضيفية الجديدة (مستوى 1) تتجاهلها Garena تماماً، ولهذا\n"
+                "توقّفت الطريقة القديمة عن العمل في كل البوتات.\n\n"
+                "🤝 <b>الحل:</b> ساهم بحساب ضيف بمستوى "
+                f"{lvl}+ عبر /donate (اللعب ~3 مباريات كافٍ للمستوى 8).\n"
+                "كل مساهمة تخدمك وتخدم كل مستخدمي البوت."
             )
+            return
 
-        sent = 0
-        failed = 0
+        goal = min(available, settings.max_likes_per_session)
+        await self._safe_send(
+            job.user_id,
+            f"🚀 بدأ إرسال الإعجابات إلى {label}\n"
+            f"📦 حسابات متاحة (مستوى {settings.min_donor_level}+): <b>{available}</b>\n"
+            f"🎯 هدف الجلسة: <b>{goal}</b> إعجاب\n"
+            "📡 سأتحقق من العداد أثناء الإرسال وأعرض الرقم <b>المحتسب فعلياً</b>."
+        )
+
+        # ---- المرحلة 3: حلقة الإرسال مع تحقق حي ----
+        sent = 0                      # أُرسل (HTTP 200)
+        failed = 0                    # أخطاء متتالية
+        counted_at_last_check = before if before is not None else None
+        stall = 0                     # إعجابات مرسلة منذ آخر زيادة في العداد
         max_failures = max(5, settings.max_retries * 3)
-        last_error = ""
+        stop_reason = ""
 
-        for _ in range(settings.max_likes_per_session):
+        for _ in range(goal):
             if job.cancelled:
-                await self._safe_send(job.user_id, "🛑 تم إلغاء المهمة.")
-                await self.db.add_likes(job.user_id, sent)
-                return
+                stop_reason = "cancelled"
+                break
 
             try:
                 result = await self._send_one_like(job)
+            except AccountBannedError as exc:
+                logger.info("حساب محظور أثناء الإعجاب: %s", exc)
+                failed += 0  # حُذف من المخزون — لا يُحسب خطأ متتالياً
+                continue
             except (GarenaError, DailyLimitError) as exc:
                 failed += 1
-                last_error = str(exc)
                 logger.warning("فشل إرسال إعجاب: %s", exc)
                 if failed >= max_failures:
-                    await self._safe_send(
-                        job.user_id,
-                        f"⚠️ توقفت المهمة بعد {failed} أخطاء متتالية: {last_error}",
-                    )
-                    await self.db.add_likes(job.user_id, sent)
-                    return
+                    stop_reason = f"errors:{exc}"
+                    break
                 if not await self._backoff(job, random.uniform(2, 5)):
-                    await self._safe_send(job.user_id, "🛑 تم إلغاء المهمة.")
-                    await self.db.add_likes(job.user_id, sent)
-                    return
+                    stop_reason = "cancelled"
+                    break
                 continue
-            except Exception as exc:  # شبكة/مهلة
+            except Exception as exc:  # noqa: BLE001 — شبكة/مهلة
                 failed += 1
-                last_error = str(exc)
                 logger.warning("خطأ شبكة أثناء الإعجاب: %s", exc)
                 if failed >= max_failures:
-                    await self._safe_send(
-                        job.user_id,
-                        f"⚠️ توقفت المهمة بسبب أخطاء اتصال: {last_error}",
-                    )
-                    await self.db.add_likes(job.user_id, sent)
-                    return
+                    stop_reason = f"errors:{exc}"
+                    break
                 continue
 
-            # ---- الوصول للحد اليومي → إيقاف فوري ----
+            if result is None:
+                # نفد مخزون الحسابات المتاحة لهذا الهدف
+                stop_reason = "stock_empty"
+                break
+
+            failed = 0
             if result.limit_reached:
-                await self._safe_send(
-                    job.user_id,
-                    "🎯 <b>تم الوصول إلى الحد اليومي للإعجابات!</b>\n"
-                    "📨 رسالة السيرفر: {}\n"
-                    "✅ تم إرسال <b>{}</b> إعجاب بنجاح.".format(
-                        result.message or "daily limit reached", sent
-                    ),
-                )
-                await self._finish(job, sent, before)
-                return
+                stop_reason = f"limit:{result.message or 'daily limit'}"
+                break
 
             if result.success:
                 sent += 1
+                stall += 1
                 if sent % settings.progress_every == 0:
                     await self._safe_send(
-                        job.user_id, f"✅ تم إرسال <b>{sent}</b> إعجاب حتى الآن..."
+                        job.user_id, f"📨 أُرسل <b>{sent}</b> إعجاب حتى الآن..."
                     )
             else:
                 failed += 1
-                last_error = result.message
                 if failed >= max_failures:
-                    await self._safe_send(
-                        job.user_id,
-                        f"⚠️ توقفت المهمة بسبب أخطاء متكررة: {last_error}",
-                    )
-                    await self.db.add_likes(job.user_id, sent)
-                    return
+                    stop_reason = f"errors:{result.message}"
+                    break
+                continue
 
-            # تأخير عشوائي بين الطلبات — يقلل خطر تفعيل أنظمة مكافحة البوت
+            # ---- تحقق حي من العداد كل عدة إعجابات ----
+            if sent % settings.verify_every == 0:
+                current = await self._read_likes(job)
+                if current is not None and counted_at_last_check is not None:
+                    if current > counted_at_last_check:
+                        counted_at_last_check = current
+                        stall = 0
+                    elif stall >= settings.stall_window:
+                        stop_reason = "stalled"
+                        break
+                elif current is not None:
+                    counted_at_last_check = current
+                    stall = 0
+
             if not await self._backoff(
                 job,
                 random.uniform(settings.min_delay_seconds, settings.max_delay_seconds),
             ):
-                await self._safe_send(job.user_id, "🛑 تم إلغاء المهمة.")
-                await self.db.add_likes(job.user_id, sent)
-                return
+                stop_reason = "cancelled"
+                break
 
-        await self._finish(job, sent, before)
-
-    # ---------------- رسالة النهاية + التحقق النهائي ----------------
-    async def _finish(self, job: LikeJob, sent: int, before: Optional[int]) -> None:
+        # ---- المرحلة 4: القراءة النهائية + التقرير الصادق ----
+        await asyncio.sleep(2)  # مهلة بسيطة لتثبيت العداد
         after = await self._read_likes(job)
-        final_lines = [
-            "🏁 <b>انتهت الجلسة</b> — تم إرسال <b>{}</b> إعجاب إلى <code>{}</code>.".format(
-                sent, job.target_uid
-            ),
-        ]
+        await self._finish_report(job, name, sent, before, after, stop_reason)
+
+    # ---------------- تقرير النهاية ----------------
+    async def _finish_report(
+        self,
+        job: LikeJob,
+        name: str,
+        sent: int,
+        before: Optional[int],
+        after: Optional[int],
+        stop_reason: str,
+    ) -> None:
+        counted: Optional[int] = None
         if before is not None and after is not None:
-            delta = max(0, after - before)
-            final_lines.append(
-                f"📈 التحقق: عدد الإعجابات <b>{before}</b> ← <b>{after}</b> (+{delta})"
+            counted = max(0, after - before)
+
+        lines: List[str] = []
+        if stop_reason == "cancelled":
+            lines.append("🛑 <b>أُلغيت المهمة.</b>")
+        else:
+            lines.append("🏁 <b>انتهت الجلسة</b>")
+
+        lines.append(f"👤 الحساب: <b>{name}</b> (<code>{job.target_uid}</code>) — {job.region}")
+        lines.append(f"📨 أُرسل: <b>{sent}</b> إعجاب من حسابات حقيقية موثقة.")
+
+        if before is not None and after is not None:
+            lines.append(
+                f"📈 العداد في اللعبة: <b>{before}</b> ← <b>{after}</b> "
+                f"(+{counted} محتسب ✅)"
             )
-        final_lines.append(
-            "💡 إن لم يكتمل الحد اليومي، يمكنك طلب جلسة أخرى بعد ساعة."
-        )
-        await self._safe_send(job.user_id, "\n".join(final_lines))
-        await self.db.add_likes(job.user_id, sent)
+            if sent > 0 and counted == 0:
+                lines.append(
+                    "⚠️ <b>تنبيه:</b> لم تُحتسب الإعجابات رغم نجاح الإرسال — "
+                    "غالباً تجاوز الهدف سقف الاستقبال اليومي من حسابات "
+                    "مستوى 8-20 (~20/يوم). جرّب غداً بعد التصفير اليومي."
+                )
+            elif counted is not None and 0 < counted < sent:
+                lines.append(
+                    "ℹ️ جزء من الإعجابات لم يُحتسب (سقف Garena الداخلي للاستقبال اليومي) — "
+                    "هذا طبيعي؛ العدد الكامل يتطلب مرسلين بمستوى 22+."
+                )
+        else:
+            lines.append("ℹ️ تعذّرت قراءة العداد النهائي (السيرفر بطيء) — تحقق داخل اللعبة.")
+
+        if stop_reason.startswith("limit:"):
+            lines.append(f"🎯 توقف: بلوغ حد المرسلين اليومي ({stop_reason[6:][:80]}).")
+        elif stop_reason == "stalled":
+            lines.append(
+                "🎯 توقف مبكر: العداد ثبت رغم استمرار الإرسال — وفرنا عليك بقية المحاولات."
+            )
+        elif stop_reason == "stock_empty":
+            lines.append(
+                "📦 استُهلك المخزون المتاح لهذا الهدف اليوم — كل حساب يعجب مرة كل 20 ساعة."
+            )
+        elif stop_reason.startswith("errors:"):
+            lines.append(f"⚠️ توقف بسبب أخطاء متكررة: {stop_reason[7:][:120]}")
+
+        lines.append("💡 ساهم بحساب مستوى 8+ عبر /donate لزيادة قدرة البوت.")
+        await self._safe_send(job.user_id, "\n".join(lines))
+        await self.db.add_likes(job.user_id, sent, counted or 0)
 
     # ---------------- انتظار قابل للإلغاء ----------------
     async def _backoff(self, job: LikeJob, seconds: float) -> bool:
-        """ينتظر المدة المطلوبة لكنه يستجيب فوراً لأمر الإلغاء.
-        يعيد False إذا أُلغيت المهمة أثناء الانتظار."""
         waited = 0.0
         while waited < seconds:
             if job.cancelled:
@@ -238,100 +429,61 @@ class LikeEngine:
             waited += 0.25
         return True
 
-    # ---------------- إرسال إعجاب واحد بحساب ضيف ----------------
-    async def _send_one_like(self, job: LikeJob):
-        """يحاول تسجيل حساب ضيف جديد؛ عند الفشل يلجأ إلى مخزون الحسابات
-        الحقيقية المحفوظة (كل حساب = إعجاب واحد لنفس الهدف). إذا نجح التسجيل
-        يُحفظ الحساب الجديد في المخزون لاستخدامه لاحقاً من أي مستخدم.
+    # ---------------- إرسال إعجاب واحد من المخزون الموثق ----------------
+    async def _send_one_like(self, job: LikeJob) -> Optional[object]:
+        """يلتقط أفضل حساب متاح (مستوى ≥ الحد، غير مستخدم للهدف خلال 20س)
+        ويرسل منه إعجاباً واحداً.
 
-        نظام التبادل: الحسابات المحفوظة تُستخدم لطلبات المستخدمين الآخرين —
-        كل حساب يمكنه إعجاب كل هدف مرة واحدة فقط."""
-        register_exc: Optional[Exception] = None
-        try:
-            guest = await self.client.register_guest(job.region)
-        except GarenaError as exc:
-            register_exc = exc
-            logger.warning(
-                "تعذر تسجيل ضيف جديد (%s): %s — المحاولة من مخزون الحسابات",
-                job.region,
-                exc,
-            )
-            return await self._like_from_stock(job, register_exc)
-
-        # التسجيل نجح → احفظ الحساب الجديد في المخزون مع كل بياناته
-        try:
-            await self.db.save_guest_account(
-                account_uid=guest.uid,
-                region=guest.region,
-                password_hash=guest.password_hash,
-                password=guest.password,
-                nickname=guest.nickname,
-                access_token=guest.access_token,
-                open_id=guest.open_id,
-            )
-        except Exception as exc:  # noqa: BLE001 — الفشل هنا لا يوقف الإعجاب
-            logger.debug("تعذر حفظ الحساب الجديد في المخزون: %s", exc)
-
-        session = await self.client.major_login(
-            guest.access_token, guest.open_id, job.region
-        )
-        result = await self.client.send_like(session, job.target_uid, job.region)
-        if result.success:
-            await self.db.mark_guest_used(guest.uid, job.target_uid, job.region)
-        return result
-
-    async def _like_from_stock(self, job: LikeJob, register_exc: Optional[Exception] = None):
-        """يستخدم حساباً جاهزاً من المخزون لإرسال إعجاب واحد لنفس الهدف.
-
-        نظام التبادل: الحسابات التي أنشأها مستخدمون آخرون تُستخدم هنا —
-        كل حساب يمكنه إعجاب كل هدف مرة واحدة فقط (unique per account_uid + target_uid).
-
-        إذا ردّ Garena بـ auth_error على Token Grant (حساب غير صالح/محذوف)
-        يُحذف الحساب من المخزون تلقائياً حتى لا يتكرر نفس الخطأ إلى الأبد."""
+        يعيد:
+          LikeResult — نتيجة الإرسال
+          None       — لا يوجد حساب متاح (نفد المخزون للهدف)
+        يرفع:
+          AccountBannedError — بعد وسم الحساب banned في المخزون (يُتخطى)
+          GarenaError        — فشل دخول/شبكة يستحق إعادة المحاولة بخطأ متتالي
+        """
         account = await self.db.get_available_guest(job.region, job.target_uid)
         if account is None:
-            base = f"لا توجد حسابات جاهزة متبقية لمنطقة {job.region} لهذا الهدف."
-            if register_exc is not None:
-                base += f" سبب فشل التسجيل: {register_exc}"
-            raise GarenaError(base)
-        uid, password_hash, password = account
+            return None
+        uid, password_hash = account
 
-        # محاولة الحصول على توكن جديد
+        # دخول حقيقي بالحساب المساهَم به
         try:
             access_token, open_id = await self.client.token_grant(uid, password_hash)
         except GarenaError as exc:
-            if "auth" in str(exc).lower():
-                try:
-                    await self.db.delete_guest_account(uid)
-                    logger.info("حُذف حساب جاهز غير صالح من المخزون: %s", uid)
-                except Exception as db_exc:  # noqa: BLE001
-                    logger.debug("تعذر حذف الحساب غير الصالح %s: %s", uid, db_exc)
+            msg = str(exc).lower()
+            if "auth" in msg or "invalid" in msg or "password" in msg:
+                # بيانات غير صالحة (ربما غيّر المستخدم كلمة السر) → إقصاء
+                await self._mark_invalid(uid, f"token_grant: {exc}")
+                raise AccountBannedError(f"حساب غير صالح أُقصي: {uid}") from exc
             raise
 
-        # حدّث التوكن في قاعدة البيانات
+        try:
+            session = await self.client.major_login(access_token, open_id, job.region)
+        except AccountBannedError as exc:
+            await self._mark_invalid(uid, f"banned: {exc.reason}", status="banned")
+            raise
+
         try:
             await self.db.update_account_token(uid, access_token, open_id)
         except Exception as exc:  # noqa: BLE001
             logger.debug("تعذر تحديث التوكن للحساب %s: %s", uid, exc)
 
-        session = await self.client.major_login(access_token, open_id, job.region)
         result = await self.client.send_like(session, job.target_uid, job.region)
         if result.success:
             await self.db.mark_guest_used(uid, job.target_uid, job.region)
         return result
 
-    # ---------------- قراءة عدد الإعجابات (أفضل جهد) ----------------
-    async def _read_likes(self, job: LikeJob) -> Optional[int]:
+    async def _mark_invalid(self, uid: str, note: str, status: str = "invalid") -> None:
         try:
-            guest = await self.client.register_guest(job.region)
-            session = await self.client.major_login(
-                guest.access_token, guest.open_id, job.region
-            )
-            info = await self.client.get_player_info(session, job.target_uid, job.region)
-            return info.likes if info else None
+            await self.db.set_account_status(uid, status, note[:200])
+            logger.info("وُسم الحساب %s كـ %s (%s)", uid, status, note)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("تعذر قراءة عدد الإعجابات: %s", exc)
-            return None
+            logger.debug("تعذر تحديث حالة الحساب %s: %s", uid, exc)
+
+    # ---------------- قراءة عدد الإعجابات ----------------
+    async def _read_likes(self, job: LikeJob) -> Optional[int]:
+        info = await self.read_target_info(job.region, job.target_uid)
+        return info.likes if info else None
 
     # ---------------- إرسال آمن ----------------
     async def _safe_send(self, user_id: int, text: str) -> None:
