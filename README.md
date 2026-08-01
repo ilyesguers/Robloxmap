@@ -44,7 +44,7 @@
 ├── services/
 │   ├── garena.py                  # ⭐ عميل Garena الحقيقي (OB53): تسجيل ضيف + JWT + إعجاب + تحقق
 │   ├── like_engine.py             # ⭐ المحرك: صف انتظار + حلقة إعجابات + حد يومي + إلغاء فوري
-│   └── database.py                # SQLite: مستخدمون، إحصائيات، حظر، Rate limit
+│   └── database.py                # PostgreSQL (asyncpg): مستخدمون، إحصائيات، حظر، Rate limit
 ├── utils/
 │   ├── logger.py                  # سجلات stdout (لـ Railway)
 │   ├── validators.py              # التحقق من UID
@@ -102,16 +102,20 @@
 2. افتح [railway.app](https://railway.app) وسجّل (رصيد تجريبي مجاني).
 3. **New Project** ← **Deploy from GitHub repo** ← اختر `Robloxmap`.
 4. انتظر البناء (Nixpacks يكتشف Python تلقائياً — `Procfile` موجود).
-5. تبويب **Variables** — أضف متغيرين فقط:
+5. أضف قاعدة بيانات: **New** ← **Database** ← **Add PostgreSQL** (في نفس المشروع).
+6. تبويب **Variables** — أضف ثلاثة متغيرات:
    | المتغير | القيمة |
    |---|---|
    | `BOT_TOKEN` | من [@BotFather](https://t.me/BotFather) |
    | `ADMIN_ID` | معرّفك الرقمي (من [@userinfobot](https://t.me/userinfobot)) |
+   | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` — عبر **Add Variable Reference** ← Postgres ← `DATABASE_URL` |
 
+   ⚠️ لا تنسخ قيمة الربط كنص ولا من `.env.example` — استخدم مرجع المتغير
+   (Reference) وإلا ظهر الخطأ `socket.gaierror: Name or service not known`.
    كل ما عدا ذلك له قيم افتراضية مدمجة (روابط Garena، مفاتيح AES، التوقيعات، الحدود).
 
-6. **Redeploy** ثم **View Logs** — يجب أن يظهر `🚀 البوت يعمل الآن...`.
-7. افتح البوت في تيليجرام وأرسل `/start` — جاهز! 🎉
+7. **Redeploy** ثم **View Logs** — يجب أن يظهر `🚀 البوت يعمل الآن...`.
+8. افتح البوت في تيليجرام وأرسل `/start` — جاهز! 🎉
 
 ### تحقق سريع بعد النشر (مهم)
 من تبويب **Deployments** على Railway افتح **Shell** (أو أضف أمر تشغيل مؤقت)
@@ -164,7 +168,19 @@ python tests/live_check.py    # فحص حي (شغّله من Railway — الس�
 | `PROXIES` | فارغ | بروكسيات ثابتة مفصولة بفواصل |
 | `PROXY_API_URL` | فارغ | رابط API بروكسيات دوّارة |
 | `RATE_LIMIT_HOURS` | `1` | انتظار المستخدم بين الطلبات |
-| `DB_PATH` | `data/bot.db` | مسار قاعدة البيانات |
+| `DB_CONNECT_RETRIES` | `5` | عدد محاولات الاتصال بقاعدة البيانات عند الإقلاع |
+| `DB_CONNECT_RETRY_DELAY` | `3.0` | ثواني الانتظار بين محاولات الاتصال |
+
+---
+
+## ❗ استكشاف أخطاء Railway الشائعة
+
+| الخطأ في السجلات | السبب | الحل |
+|---|---|---|
+| `socket.gaierror: Name or service not known` | اسم المضيف في `DATABASE_URL` غير موجود (قيمة تجريبية منسوخة / مرجع غير مُوسَّع / لا يوجد Postgres في المشروع) | أنشئ Postgres في المشروع ثم اضبط `DATABASE_URL = ${{Postgres.DATABASE_URL}}` عبر **Add Variable Reference** |
+| `⚠️ تعذّر الاتصال بقاعدة بيانات PostgreSQL` | نفس السبب — بعد هذا الإصلاح تظهر رسالة عربية مفصلة تشرح الخطوات | اتبع خطوات الرسالة الظاهرة في السجلات |
+| `InvalidPasswordError` / رفض المصادقة | مستخدم/كلمة مرور/اسم قاعدة خاطئ | أعد توليد الرابط من خدمة Postgres أو استخدم المرجع |
+| `error_not_found` من Garena | IP مركز بيانات Railway مرفوض لتسجيل الضيوف | فعّل `PROXIES` أو `PROXY_API_URL` |
 
 ---
 

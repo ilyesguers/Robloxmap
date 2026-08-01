@@ -40,6 +40,9 @@ class Settings:
 
     # ============ قاعدة البيانات ============
     database_url: str = os.getenv("DATABASE_URL", "")
+    # مهلة الاتصال عند الإقلاع (Postgres على Railway قد يحتاج ثواني ليستيقظ)
+    db_connect_retries: int = _get_int("DB_CONNECT_RETRIES", 5)
+    db_connect_retry_delay: float = _get_float("DB_CONNECT_RETRY_DELAY", 3.0)
 
     # ============ منطق الإعجابات (اختياري) ============
     max_likes_per_session: int = _get_int("MAX_LIKES_PER_SESSION", 100)
