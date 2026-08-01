@@ -164,10 +164,12 @@ async def on_my_stats(callback: CallbackQuery, db: Database) -> None:
     if not info:
         await callback.message.answer("ℹ️ لا توجد بيانات بعد — ابدأ أول طلب.")
         return
+    total_stock = await db.guest_stock_count()
     await callback.message.answer(
         "📊 <b>إحصائياتك:</b>\n"
         f"• عدد الطلبات: {info['total_requests']}\n"
-        f"• إجمالي الإعجابات المرسلة: {info['total_likes']}"
+        f"• إجمالي الإعجابات المرسلة: {info['total_likes']}\n\n"
+        f"📦 مخزون الحسابات المشتركة: {total_stock} حساب"
     )
 
 

@@ -5,7 +5,11 @@
   2) تسجيل دخول → JWT
   3) إرسال الإعجاب للـ UID المستهدف
   4) عند الوصول للحد اليومي → إيقاف فوري + إشعار المستخدم
-  والتحقق النهائي: قراءة عدد الإعجابات من بروفايل الهدف قبل/بعد.
+
+نظام التبادل:
+  - كل حساب يُحفظ في قاعدة البيانات مع كل بياناته (uid, password, access_token, open_id)
+  - أي مستخدم يطلب إعجاب يمكنه الاستفادة من حسابات أنشأها مستخدمون آخرون
+  - كل حساب يُستخدم مرة واحدة فقط لكل هدف (account_uid + target_uid)
 """
 
 from __future__ import annotations
@@ -238,11 +242,10 @@ class LikeEngine:
     async def _send_one_like(self, job: LikeJob):
         """يحاول تسجيل حساب ضيف جديد؛ عند الفشل يلجأ إلى مخزون الحسابات
         الحقيقية المحفوظة (كل حساب = إعجاب واحد لنفس الهدف). إذا نجح التسجيل
-        يُحفظ الحساب الجديد في المخزون.
+        يُحفظ الحساب الجديد في المخزون لاستخدامه لاحقاً من أي مستخدم.
 
-        ملاحظة مهمة: سبب فشل التسجيل يُسجَّل في السجل (logger) ولا يُبتلع —
-        كان ابتلاع الخطأ في النسخة السابقة يخفي السبب الحقيقي وراء ظهور
-        أخطاء Token Grant فقط في سجلات Railway."""
+        نظام التبادل: الحسابات المحفوظة تُستخدم لطلبات المستخدمين الآخرين —
+        كل حساب يمكنه إعجاب كل هدف مرة واحدة فقط."""
         register_exc: Optional[Exception] = None
         try:
             guest = await self.client.register_guest(job.region)
@@ -255,9 +258,17 @@ class LikeEngine:
             )
             return await self._like_from_stock(job, register_exc)
 
-        # التسجيل نجح → احفظ الحساب الجديد في المخزون لاستخدامه لاحقاً
+        # التسجيل نجح → احفظ الحساب الجديد في المخزون مع كل بياناته
         try:
-            await self.db.save_guest_account(guest.uid, guest.region, guest.password_hash)
+            await self.db.save_guest_account(
+                account_uid=guest.uid,
+                region=guest.region,
+                password_hash=guest.password_hash,
+                password=guest.password,
+                nickname=guest.nickname,
+                access_token=guest.access_token,
+                open_id=guest.open_id,
+            )
         except Exception as exc:  # noqa: BLE001 — الفشل هنا لا يوقف الإعجاب
             logger.debug("تعذر حفظ الحساب الجديد في المخزون: %s", exc)
 
@@ -272,6 +283,9 @@ class LikeEngine:
     async def _like_from_stock(self, job: LikeJob, register_exc: Optional[Exception] = None):
         """يستخدم حساباً جاهزاً من المخزون لإرسال إعجاب واحد لنفس الهدف.
 
+        نظام التبادل: الحسابات التي أنشأها مستخدمون آخرون تُستخدم هنا —
+        كل حساب يمكنه إعجاب كل هدف مرة واحدة فقط (unique per account_uid + target_uid).
+
         إذا ردّ Garena بـ auth_error على Token Grant (حساب غير صالح/محذوف)
         يُحذف الحساب من المخزون تلقائياً حتى لا يتكرر نفس الخطأ إلى الأبد."""
         account = await self.db.get_available_guest(job.region, job.target_uid)
@@ -280,7 +294,9 @@ class LikeEngine:
             if register_exc is not None:
                 base += f" سبب فشل التسجيل: {register_exc}"
             raise GarenaError(base)
-        uid, password_hash = account
+        uid, password_hash, password = account
+
+        # محاولة الحصول على توكن جديد
         try:
             access_token, open_id = await self.client.token_grant(uid, password_hash)
         except GarenaError as exc:
@@ -291,6 +307,13 @@ class LikeEngine:
                 except Exception as db_exc:  # noqa: BLE001
                     logger.debug("تعذر حذف الحساب غير الصالح %s: %s", uid, db_exc)
             raise
+
+        # حدّث التوكن في قاعدة البيانات
+        try:
+            await self.db.update_account_token(uid, access_token, open_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("تعذر تحديث التوكن للحساب %s: %s", uid, exc)
+
         session = await self.client.major_login(access_token, open_id, job.region)
         result = await self.client.send_like(session, job.target_uid, job.region)
         if result.success:
