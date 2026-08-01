@@ -2,14 +2,21 @@
 
 الربط عبر متغير البيئة DATABASE_URL فقط (رابط PostgreSQL على Railway).
 مثال: postgresql://postgres:password@hostname:port/railway
+
+عند الإقلاع: يُتحقق من شكل الرابط مبكراً، وتُعاد محاولة الاتصال مع تراجع
+(أخطاء الشبكة/DNS المؤقتة شائعة أثناء إقلاع Postgres على Railway)، وعند
+الفشل النهائي تُطبع رسالة تشخيص واضحة بدل تتبّع مربك.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import socket
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import asyncpg
 
@@ -17,6 +24,39 @@ from config import settings
 from services.garena import SEED_GUEST_ACCOUNTS
 
 logger = logging.getLogger(__name__)
+
+# أسماء مضيفات لا يمكن أن تعمل داخل حاوية Railway إطلاقاً
+# (القيم التجريبية في .env.example وعناوين الاسترجاع المحلية).
+_LOCAL_OR_PLACEHOLDER_HOSTS = {
+    "localhost", "127.0.0.1", "::1", "0.0.0.0",
+    "host", "hostname", "example.com", "postgres.example.com",
+}
+
+
+def _mask_dsn(dsn: str) -> str:
+    """يعيد الرابط مع إخفاء كلمة المرور (لعرضه آمناً في السجلات)."""
+    try:
+        parts = urlsplit(dsn)
+        host = parts.hostname or "<؟>"
+        netloc = host
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        if parts.username:
+            netloc = f"{parts.username}:***@{netloc}"
+        return f"{parts.scheme}://{netloc}{parts.path or ''}"
+    except Exception:
+        return "<رابط غير قابل للقراءة>"
+
+
+def _describe_error(exc: BaseException) -> str:
+    """وصف عربي مبسّط لخطأ الاتصال."""
+    if isinstance(exc, socket.gaierror):
+        return f"تعذّر حلّ اسم المضيف عبر DNS — {exc}"
+    if isinstance(exc, ConnectionRefusedError):
+        return f"الاتصال مرفوض (لا يوجد Postgres يستمع على هذا العنوان/المنفذ) — {exc}"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "انتهت مهلة الاتصال بقاعدة البيانات"
+    return f"{type(exc).__name__}: {exc}"
 
 
 class Database:
@@ -34,11 +74,85 @@ class Database:
         dsn = self._dsn
         if dsn.startswith("postgres://"):
             dsn = "postgresql://" + dsn[len("postgres://"):]
-        self._pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+
+        self._validate_dsn(dsn)
+        await self._connect_with_retry(dsn)
+
         await self._create_tables()
         # حقن الحسابات الجاهزة (فقط إذا كان المخزون فارغاً)
         await self._seed_accounts()
         logger.info("✅ تم الاتصال بقاعدة بيانات PostgreSQL")
+
+    # ---------------- التحقق والاتصال ----------------
+    def _validate_dsn(self, dsn: str) -> None:
+        """يرفض القيم الخاطئة البدهية مبكراً برسالة واضحة بدل انهيار DNS مربك."""
+        if "${{" in dsn or "}}" in dsn:
+            raise SystemExit(
+                "⚠️ DATABASE_URL يحتوي مرجع Railway غير مُوسَّع حرفياً: "
+                f"{dsn[:60]}\n"
+                "لا تنسخ ${{Postgres.DATABASE_URL}} كنص عادي — في تبويب Variables\n"
+                "اضغط «Add Variable Reference» واختر Postgres ← DATABASE_URL\n"
+                "حتى تستبدلها Railway بالقيمة الفعلية تلقائياً."
+            )
+        parts = urlsplit(dsn)
+        if not parts.scheme.startswith("postgresql") or not parts.hostname:
+            raise SystemExit(
+                f"⚠️ DATABASE_URL ليس رابط PostgreSQL صالحاً: {_mask_dsn(dsn)}\n"
+                "الصيغة المطلوبة: postgresql://user:password@host:port/database"
+            )
+        host = parts.hostname.lower()
+        if host in _LOCAL_OR_PLACEHOLDER_HOSTS:
+            raise SystemExit(
+                f"⚠️ DATABASE_URL يحتوي مضيفاً لا يعمل على Railway: '{parts.hostname}'\n"
+                "يبدو أنك نسخت القيمة التجريبية من .env.example حرفياً.\n"
+                "الحل: أنشئ Postgres في مشروعك (New ← Database ← Add PostgreSQL)\n"
+                "ثم اضبط المتغير كمرجع: DATABASE_URL = ${{Postgres.DATABASE_URL}}"
+            )
+
+    async def _connect_with_retry(self, dsn: str) -> None:
+        """ينشئ التجمع مع إعادة محاولة للأخطاء الشبكية (إقلاع Postgres قد يتأخر)."""
+        retries = max(1, settings.db_connect_retries)
+        delay = max(0.5, settings.db_connect_retry_delay)
+        host = urlsplit(dsn).hostname or "؟"
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(1, retries + 1):
+            try:
+                self._pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+                return
+            except (OSError, asyncio.TimeoutError) as exc:
+                # يشمل socket.gaierror (DNS) وConnectionRefused وانتهاء المهلة
+                # وأخطاء اتصال asyncpg (ترث OSError)
+                last_error = exc
+                if attempt < retries:
+                    logger.warning(
+                        "⚠️ محاولة الاتصال بقاعدة البيانات %d/%d فشلت (%s) — "
+                        "إعادة المحاولة بعد %.1f ثانية...",
+                        attempt, retries, _describe_error(exc), delay,
+                    )
+                    await asyncio.sleep(delay)
+            except asyncpg.PostgresError as exc:
+                # أخطاء المصادقة/الصلاحيات — إعادة المحاولة لن تفيد
+                raise SystemExit(
+                    "⚠️ قاعدة البيانات رفضت الاتصال (تحقق من المستخدم/كلمة المرور/اسم القاعدة):\n"
+                    f"الرابط: {_mask_dsn(dsn)}\n"
+                    f"الخطأ: {exc}"
+                ) from exc
+
+        raise SystemExit(
+            "⚠️ تعذّر الاتصال بقاعدة بيانات PostgreSQL بعد عدة محاولات.\n"
+            f"الرابط (كلمة المرور مخفية): {_mask_dsn(dsn)}\n"
+            f"الخطأ الأخير: {_describe_error(last_error)}\n\n"
+            f"المعنى: لا يمكن الوصول إلى المضيف '{host}' من داخل حاوية البوت.\n"
+            "الحل على Railway:\n"
+            "  1) تأكد أن مشروعك يحتوي Postgres: New ← Database ← Add PostgreSQL.\n"
+            "  2) في خدمة البوت ← Variables اضبط:\n"
+            "       DATABASE_URL = ${{Postgres.DATABASE_URL}}\n"
+            "     عبر «Add Variable Reference» (وليس نسخاً نصياً).\n"
+            "  3) إن كانت القاعدة في مشروع آخر: استخدم الرابط العام من تبويب\n"
+            "     Connect ← Public Networking (المضيف بالشكل *.proxy.rlwy.net مع منفذه).\n"
+            "  4) Redeploy بعد التصحيح."
+        )
 
     async def close(self) -> None:
         if self._pool:

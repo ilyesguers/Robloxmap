@@ -78,5 +78,12 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).info("تم إيقاف البوت.")
+    except SystemExit as exc:
+        # رسائل الإعداد/الفحص (SystemExit برسالة) يجب أن تبقى ظاهرة في
+        # سجلات Railway وأن تُحسب العملية فاشلة (حتى تعمل سياسة إعادة
+        # التشغيل ON_FAILURE) — لذلك نعيد رفعها بدل ابتلاعها.
+        if exc.code not in (None, 0):
+            raise
         logging.getLogger(__name__).info("تم إيقاف البوت.")
