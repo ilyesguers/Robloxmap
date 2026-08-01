@@ -605,7 +605,7 @@ class GarenaClient:
             "X-GA": "v1 1",
             "ReleaseVersion": RELEASE_VERSION,
             "Content-Type": "application/octet-stream",
-            "Authorization": "Bearer",
+            "Authorization": f"Bearer {access_token}",
         }
         last_err = "بدون رد"
         for url in self._major_login_urls(region):

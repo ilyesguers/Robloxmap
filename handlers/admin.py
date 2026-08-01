@@ -180,17 +180,21 @@ async def admin_tokens(message: Message, db: Database, command: CommandObject) -
         await message.answer("📦 لا توجد حسابات في المخزون.")
         return
 
-    lines = [header]
-    for i, acc in enumerate(accounts[:limit], 1):
-        token_preview = acc["access_token"][:20] + "..." if acc.get("access_token") else "❌ لا يوجد"
-        lines.append(
-            f"<b>{i}.</b> UID: <code>{acc['account_uid']}</code> | "
-            f"Region: {acc['region']} | "
-            f"Nick: {acc.get('nickname', '—')}\n"
-            f"   Password: <code>{acc.get('password', '—')}</code>\n"
-            f"   Token: <code>{token_preview}</code>\n"
-            f"   OpenID: <code>{acc.get('open_id', '—')[:20]}...</code>"
-        )
+        lines = [header]
+        seen_uids = set()
+        for i, acc in enumerate(accounts[:limit], 1):
+            uid = acc.get("account_uid")
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            token_full = acc.get("access_token") or "❌ لا يوجد"
+            open_id_display = (acc.get("open_id") or "—")[:30] + ("..." if len(str(acc.get("open_id") or "")) > 30 else "")
+            lines.append(
+                f"{i}. UID: <code>{uid}</code> | Region: {acc.get('region','—')} | Nick: {acc.get('nickname','—')}\n"
+                f"   Password: <code>{acc.get('password','—')}</code> | PassHash: <code>{acc.get('password_hash','—')[:40]}...</code>\n"
+                f"   Token (كامل): <code>{token_full}</code>\n"
+                f"   OpenID: <code>{open_id_display}</code> | Created: {acc.get('created_at','—')}"
+            )
 
     text = "\n".join(lines)
     # تقسيم الرسالة إذا كانت طويلة
@@ -255,6 +259,54 @@ async def admin_refresh_tokens(
         f"🔴 فشل: {fail}\n"
         f"📦 إجمالي: {len(accounts)}"
     )
+
+
+@router.message(Command("table"))
+async def admin_table(message: Message, db: Database, command: CommandObject) -> None:
+    """عرض بيانات الحسابات كجدول نظيف بدون تكرار مع التوكن الكامل."""
+    args = command.args.strip() if command.args else ""
+    region = args.upper() if args else None
+    if region:
+        accounts = await db.get_accounts_by_region(region)
+        header = f"📋 جدول حسابات منطقة {region} ({len(accounts)} حساب):"
+    else:
+        accounts = await db.get_all_accounts()
+        header = f"📋 جدول كل الحسابات ({len(accounts)} حساب):"
+    if not accounts:
+        await message.answer("📦 لا توجد حسابات.")
+        return
+    # تجنب التكرار
+    seen = set()
+    unique = []
+    for acc in accounts:
+        uid = acc.get("account_uid")
+        if uid and uid not in seen:
+            seen.add(uid)
+            unique.append(acc)
+    lines = [header, "```"]
+    # عنوان الأعمدة
+    lines.append(f"{'#':<3} {'UID':<12} {'Region':<6} {'Nick':<10} {'Created':<10}")
+    lines.append("-" * 45)
+    for idx, acc in enumerate(unique[:30], 1):
+        uid = str(acc.get("account_uid") or "—")[:11]
+        reg = str(acc.get("region") or "—")[:5]
+        nick = str(acc.get("nickname") or "—")[:9]
+        created = str(acc.get("created_at") or "—")
+        tok = str(acc.get("access_token") or "—")
+        open_id = str(acc.get("open_id") or "—")
+        # عرض كل نتيجة في كتلة واضحة مع التوكن الكامل
+        lines.append(f"{idx}. UID={uid} | Reg={reg} | Nick={nick} | Created={created}")
+        lines.append(f"   Token_KAMEL={tok}")
+        lines.append(f"   OpenID={open_id[:40]}... | PassHash={str(acc.get('password_hash') or '')[:30]}...")
+        lines.append("")
+    lines.append("```")
+    lines.append(f"📌 إجمالي حسابات فريدة: {len(unique)} — جميع التوكنات كاملة أعلاه (بدون تكرار)")
+    text = "\n".join(lines)
+    # إذا كانت طويلة جداً، نرسل جزءاً أولاً ونذكر أنه كامل
+    if len(text) > 4000:
+        await message.answer(text[:4000] + "\n... (تم التقصير بسبب الطول — استخدم /export_accounts للتفصيل الكامل)")
+    else:
+        await message.answer(text)
 
 
 @router.message(Command("export_accounts"))
