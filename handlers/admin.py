@@ -1,12 +1,14 @@
 """لوحة تحكم الأدمن: /stats، /broadcast، /ban، /unban، /queue، /clear_queue،
-/stock، /tokens، /refresh_tokens.
+/pool، /addaccounts، /checkaccounts.
 
 كل هذه الأوامر تعمل فقط لصاحب البوت (ADMIN_ID من متغيرات البيئة).
 """
-
 from __future__ import annotations
 
 import asyncio
+import html
+import logging
+import time
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -14,8 +16,11 @@ from aiogram.types import Message
 
 from config import settings
 from services.database import Database
-from services.garena import GarenaClient, GarenaError
+from services.garena import AccountBannedError, GarenaError
 from services.like_engine import LikeEngine
+from services.pool import parse_donation_lines, validate_and_store
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="admin")
 
@@ -26,20 +31,22 @@ router.message.filter(F.from_user.id == settings.admin_id)
 @router.message(Command("stats"))
 async def admin_stats(message: Message, db: Database, engine: LikeEngine) -> None:
     s = await db.get_stats()
-    stock_by_region = await db.guest_stock_by_region()
-    stock_lines = "\n".join(
-        f"  • {region}: {count}" for region, count in stock_by_region.items()
-    ) or "  (فارغ)"
+    counts = await db.pool_counts()
+    ok = counts.get("ok", 0)
+    banned = counts.get("banned", 0)
+    invalid = counts.get("invalid", 0)
+    low = counts.get("low_level", 0) + counts.get("legacy_low", 0)
     await message.answer(
         "📊 <b>إحصائيات البوت:</b>\n"
         f"👥 إجمالي المستخدمين: {s['total_users']}\n"
         f"📈 نشطون آخر 24 ساعة: {s['active_24h']}\n"
         f"📨 طلبات الإعجاب: {s['total_requests']}\n"
-        f"❤️ إجمالي الإعجابات المرسلة: {s['total_likes']}\n"
-        f"⛔ محظورون: {s['banned']}\n"
-        f"🔄 قائمة الانتظار: {engine.queue_size}\n"
-        f"⚙️ مهام نشطة الآن: {engine.active_count}\n\n"
-        f"📦 <b>مخزون الحسابات:</b>\n{stock_lines}"
+        f"❤️ أُرسل: {s['total_likes']} | محتسبة ✅: {s['counted_likes']}\n"
+        f"⛔ محظورون (مستخدمون): {s['banned']}\n"
+        f"🔄 قائمة الانتظار: {engine.queue_size} | ⚙️ نشطة: {engine.active_count}\n\n"
+        "📦 <b>المخزون:</b>\n"
+        f"  • صالح (ok): {ok}\n"
+        f"  • محظور: {banned} | غير صالح: {invalid} | منخفض المستوى: {low}"
     )
 
 
@@ -64,7 +71,7 @@ async def admin_broadcast(message: Message, db: Database) -> None:
             ok += 1
         except Exception:  # noqa: BLE001
             fail += 1
-        await asyncio.sleep(0.05)  # تجنب flood limit من تيليجرام
+        await asyncio.sleep(0.05)
 
     await status.edit_text(f"✅ تم الإرسال إلى {ok} مستخدم، فشل {fail}.")
 
@@ -119,233 +126,146 @@ async def admin_clear_queue(message: Message, engine: LikeEngine) -> None:
 
 
 # ========================================================
-# أوامر جديدة: مخزون الحسابات والتوكنات
+# إدارة مخزون الحسابات (بنية أغسطس 2026)
 # ========================================================
 
 
-@router.message(Command("stock"))
-async def admin_stock(message: Message, db: Database, command: CommandObject) -> None:
-    """يعرض حالة مخزون الحسابات لكل منطقة."""
-    region = command.args.strip().upper() if command.args else None
-
-    if region:
-        count = await db.guest_stock_count(region)
-        await message.answer(f"📦 مخزون حسابات منطقة {region}: <b>{count}</b> حساب")
+@router.message(Command("pool"))
+async def admin_pool(message: Message, db: Database) -> None:
+    """ملخص المخزون الصالح: المناطق، المستويات، حسابات 22+."""
+    summary = await db.stock_summary()
+    counts = await db.pool_counts()
+    if not summary:
+        await message.answer(
+            "📦 المخزون فارغ — أضف حسابات عبر /addaccounts بالصيغة:\n"
+            "<code>UID:كلمة_السر</code> (سطر لكل حساب)"
+        )
         return
-
-    stock_by_region = await db.guest_stock_by_region()
-    total = await db.guest_stock_count()
-    if not stock_by_region:
-        await message.answer("📦 المخزون فارغ حالياً.")
-        return
-
-    lines = [f"📦 <b>مخزون الحسابات ({total} إجمالي):</b>"]
-    for region, count in stock_by_region.items():
-        lines.append(f"  • {region}: {count} حساب")
+    lines = ["📦 <b>المخزون الصالح حسب السيرفر:</b>"]
+    for r in summary:
+        lines.append(
+            f"  • <b>{r['region']}</b>: {r['total']} حساب "
+            f"(⭐{r['avg_level']} وسطياً، أعلى ⭐{r['max_level']}، "
+            f"{settings.full_like_level}+: <b>{r['high_level']}</b>)"
+        )
+    ok = counts.get("ok", 0)
+    lines.append(
+        f"\nالحالات: ok={ok} | banned={counts.get('banned', 0)} | "
+        f"invalid={counts.get('invalid', 0)} | low={counts.get('low_level', 0)}"
+    )
+    lines.append(
+        f"💡 حسابات {settings.full_like_level}+ هي الوحيدة القادرة على تجاوز "
+        "سقف ~20 إعجاباً محتسباً يومياً لكل هدف."
+    )
     await message.answer("\n".join(lines))
 
 
-@router.message(Command("tokens"))
-async def admin_tokens(message: Message, db: Database, command: CommandObject) -> None:
-    """يعرض بيانات الحسابات والتوكنات — للأدمن فقط.
-
-    الاستخدام:
-      /tokens          — أول 10 حسابات
-      /tokens <N>      — أول N حسابات
-      /tokens <region> — حسابات منطقة محددة
-    """
-    args = command.args.strip() if command.args else ""
-
-    # تحديد المنطقة
-    region = None
-    limit = 10
-    if args:
-        upper = args.upper()
-        if upper.isdigit():
-            limit = min(int(upper), 50)
-        elif len(upper) <= 4:
-            region = upper
-            limit = 50
-        else:
-            limit = min(int(args), 50)
-
-    if region:
-        accounts = await db.get_accounts_by_region(region)
-        header = f"🔑 <b>حسابات منطقة {region}:</b>\n"
-    else:
-        accounts = await db.get_accounts_for_token_grant(limit)
-        header = f"🔑 <b>أول {len(accounts)} حسابات:</b>\n"
-
-    if not accounts:
-        await message.answer("📦 لا توجد حسابات في المخزون.")
-        return
-
-        lines = [header]
-        seen_uids = set()
-        for i, acc in enumerate(accounts[:limit], 1):
-            uid = acc.get("account_uid")
-            if uid in seen_uids:
-                continue
-            seen_uids.add(uid)
-            token_full = acc.get("access_token") or "❌ لا يوجد"
-            open_id_display = (acc.get("open_id") or "—")[:30] + ("..." if len(str(acc.get("open_id") or "")) > 30 else "")
-            lines.append(
-                f"{i}. UID: <code>{uid}</code> | Region: {acc.get('region','—')} | Nick: {acc.get('nickname','—')}\n"
-                f"   Password: <code>{acc.get('password','—')}</code> | PassHash: <code>{acc.get('password_hash','—')[:40]}...</code>\n"
-                f"   Token (كامل): <code>{token_full}</code>\n"
-                f"   OpenID: <code>{open_id_display}</code> | Created: {acc.get('created_at','—')}"
-            )
-
-    text = "\n".join(lines)
-    # تقسيم الرسالة إذا كانت طويلة
-    if len(text) > 4000:
-        for chunk_start in range(0, len(text), 4000):
-            chunk = text[chunk_start:chunk_start + 4000]
-            await message.answer(chunk)
-    else:
-        await message.answer(text)
-
-
-@router.message(Command("refresh_tokens"))
-async def admin_refresh_tokens(
-    message: Message, db: Database, client: GarenaClient, command: CommandObject
+@router.message(Command("addaccounts"))
+async def admin_add_accounts(
+    message: Message, db: Database, engine: LikeEngine, command: CommandObject
 ) -> None:
-    """يحدّث التوكنات لكل الحسابات في المخزون — يحصل على access_token جديد لكل حساب.
-
-    الاستخدام:
-      /refresh_tokens          — أول 20 حساب
-      /refresh_tokens <N>      — أول N حسابات
-    """
-    args = command.args.strip() if command.args else ""
-    limit = 20
-    if args and args.isdigit():
-        limit = min(int(args), 100)
-
-    accounts = await db.get_accounts_for_token_grant(limit)
-    if not accounts:
-        await message.answer("📦 لا توجد حسابات في المخزون.")
+    """إضافة حسابات دفعة واحدة — مثل /donate لكن بسقف أكبر (30 سطراً)."""
+    if not command.args:
+        await message.answer(
+            "الاستخدام: /addaccounts ثم أسطر الحسابات في نفس الرسالة:\n"
+            "<code>/addaccounts\nUID1:PASS1\nUID2:PASS2</code>\n"
+            "(حتى 30 حساباً — يُقبل الهاش الجاهز أيضاً)"
+        )
         return
 
-    status_msg = await message.answer(
-        f"🔄 جاري تحديث التوكنات لـ {len(accounts)} حساب..."
-    )
+    pairs, rejected = parse_donation_lines(command.args, max_lines=30)
+    if not pairs:
+        await message.answer(
+            "❌ لم يُفهم أي سطر. الصيغة: <code>UID:كلمة_السر</code>\n"
+            + ("\n".join(f"• {html.escape(r)}" for r in rejected[:5]) if rejected else "")
+        )
+        return
 
-    ok = 0
-    fail = 0
-    for acc in accounts:
-        uid = acc["account_uid"]
-        password_hash = acc["password_hash"]
-        try:
-            access_token, open_id = await client.token_grant(uid, password_hash)
-            await db.update_account_token(uid, access_token, open_id)
-            ok += 1
-        except GarenaError as exc:
-            fail += 1
-            # حذف الحساب غير الصالح
-            if "auth" in str(exc).lower():
-                await db.delete_guest_account(uid)
-                logger.info("حُذف حساب غير صالح أثناء تحديث التوكنات: %s", uid)
-            else:
-                logger.warning("فشل تحديث توكن %s: %s", uid, exc)
-        except Exception as exc:  # noqa: BLE001
-            fail += 1
-            logger.warning("خطأ أثناء تحديث توكن %s: %s", uid, exc)
-        # تأخير بسيط لتجنب rate limit
+    status = await message.answer(
+        f"🔐 جاري التحقق الحقيقي من <b>{len(pairs)}</b> حساب (دخول + مستوى + حظر)..."
+    )
+    results = []
+    for i, (uid, password) in enumerate(pairs, 1):
+        res = await validate_and_store(
+            db, engine.client, uid, password, message.from_user.id
+        )
+        results.append(res)
+        if i % 5 == 0 or i == len(pairs):
+            try:
+                await status.edit_text(
+                    f"🔐 تم فحص {i}/{len(pairs)} — "
+                    f"مقبول: {sum(1 for r in results if r.ok)}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
         await asyncio.sleep(1)
 
-    await status_msg.edit_text(
-        f"✅ <b>انتهى تحديث التوكنات:</b>\n"
-        f"🟢 نجح: {ok}\n"
-        f"🔴 فشل: {fail}\n"
-        f"📦 إجمالي: {len(accounts)}"
-    )
+    lines = [r.line() for r in results]
+    if rejected:
+        lines += [f"⚠️ {html.escape(r)}" for r in rejected[:5]]
+    accepted = sum(1 for r in results if r.ok)
+    lines.append(f"\n📦 النتيجة: <b>{accepted}/{len(results)}</b> حساباً أُضيف للمخزون.")
 
-
-@router.message(Command("table"))
-async def admin_table(message: Message, db: Database, command: CommandObject) -> None:
-    """عرض بيانات الحسابات كجدول نظيف بدون تكرار مع التوكن الكامل."""
-    args = command.args.strip() if command.args else ""
-    region = args.upper() if args else None
-    if region:
-        accounts = await db.get_accounts_by_region(region)
-        header = f"📋 جدول حسابات منطقة {region} ({len(accounts)} حساب):"
-    else:
-        accounts = await db.get_all_accounts()
-        header = f"📋 جدول كل الحسابات ({len(accounts)} حساب):"
-    if not accounts:
-        await message.answer("📦 لا توجد حسابات.")
-        return
-    # تجنب التكرار
-    seen = set()
-    unique = []
-    for acc in accounts:
-        uid = acc.get("account_uid")
-        if uid and uid not in seen:
-            seen.add(uid)
-            unique.append(acc)
-    lines = [header, "```"]
-    # عنوان الأعمدة
-    lines.append(f"{'#':<3} {'UID':<12} {'Region':<6} {'Nick':<10} {'Created':<10}")
-    lines.append("-" * 45)
-    for idx, acc in enumerate(unique[:30], 1):
-        uid = str(acc.get("account_uid") or "—")[:11]
-        reg = str(acc.get("region") or "—")[:5]
-        nick = str(acc.get("nickname") or "—")[:9]
-        created = str(acc.get("created_at") or "—")
-        tok = str(acc.get("access_token") or "—")
-        open_id = str(acc.get("open_id") or "—")
-        # عرض كل نتيجة في كتلة واضحة مع التوكن الكامل
-        lines.append(f"{idx}. UID={uid} | Reg={reg} | Nick={nick} | Created={created}")
-        lines.append(f"   Token_KAMEL={tok}")
-        lines.append(f"   OpenID={open_id[:40]}... | PassHash={str(acc.get('password_hash') or '')[:30]}...")
-        lines.append("")
-    lines.append("```")
-    lines.append(f"📌 إجمالي حسابات فريدة: {len(unique)} — جميع التوكنات كاملة أعلاه (بدون تكرار)")
     text = "\n".join(lines)
-    # إذا كانت طويلة جداً، نرسل جزءاً أولاً ونذكر أنه كامل
-    if len(text) > 4000:
-        await message.answer(text[:4000] + "\n... (تم التقصير بسبب الطول — استخدم /export_accounts للتفصيل الكامل)")
-    else:
-        await message.answer(text)
+    for start in range(0, len(text), 4000):
+        await message.answer(text[start : start + 4000])
 
 
-@router.message(Command("export_accounts"))
-async def admin_export_accounts(message: Message, db: Database, command: CommandObject) -> None:
-    """يصدّر بيانات الحسابات كاملة — للأدمن فقط.
+@router.message(Command("checkaccounts"))
+async def admin_check_accounts(
+    message: Message, db: Database, engine: LikeEngine, command: CommandObject
+) -> None:
+    """إعادة تحقق دورية: دخول + مستوى + حظر لأقدم الحسابات غير المفحوصة.
 
-    الاستخدام:
-      /export_accounts          — كل الحسابات
-      /export_accounts <region> — حسابات منطقة محددة
+    /checkaccounts [N] — افتراضياً 20 حساباً (الأقدم فحصاً أولاً).
     """
-    args = command.args.strip() if command.args else ""
-    region = args.upper() if args else None
+    limit = 20
+    if command.args and command.args.strip().isdigit():
+        limit = max(1, min(int(command.args.strip()), 100))
 
-    if region:
-        accounts = await db.get_accounts_by_region(region)
-        header = f"📋 <b>تصدير حسابات {region}:</b>\n\n"
-    else:
-        accounts = await db.get_all_accounts()
-        header = f"📋 <b>تصدير كل الحسابات:</b>\n\n"
-
+    stale_before = int(time.time()) - 6 * 3600  # لم تُفحص منذ 6 ساعات
+    accounts = await db.accounts_to_revalidate(stale_before, limit)
     if not accounts:
-        await message.answer("📦 لا توجد حسابات.")
+        await message.answer("✅ كل الحسابات مفحوصة حديثاً — لا شيء لإعادة التحقق منه.")
         return
 
-    lines = [header]
-    for i, acc in enumerate(accounts, 1):
-        lines.append(
-            f"{i}. UID: <code>{acc['account_uid']}</code>\n"
-            f"   Password: <code>{acc.get('password', '—')}</code>\n"
-            f"   PasswordHash: <code>{acc['password_hash']}</code>\n"
-            f"   AccessToken: <code>{acc.get('access_token', '—')}</code>\n"
-            f"   OpenID: <code>{acc.get('open_id', '—')}</code>\n"
-            f"   Region: {acc['region']} | Nick: {acc.get('nickname', '—')}"
-        )
+    status = await message.answer(f"🔄 إعادة فحص <b>{len(accounts)}</b> حساب...")
+    ok = banned = invalid = errors = 0
+    for acc in accounts:
+        uid, phash, region = acc["account_uid"], acc["password_hash"], acc["region"]
+        try:
+            v = await engine.client.validate_account(uid, phash, region)
+            if v.eligible:
+                await db.upsert_validated_account(
+                    uid, v.region, phash, "", v.nickname, v.level, "ok",
+                    None, v.access_token, v.open_id,
+                )
+                ok += 1
+            else:
+                await db.upsert_validated_account(
+                    uid, v.region, phash, "", v.nickname, v.level, "low_level",
+                    None, note=f"مستوى {v.level}",
+                )
+                invalid += 1
+        except AccountBannedError as exc:
+            await db.set_account_status(uid, "banned", f"reason={exc.reason}")
+            banned += 1
+        except GarenaError as exc:
+            msg = str(exc).lower()
+            if "auth" in msg or "invalid" in msg:
+                await db.set_account_status(uid, "invalid", str(exc)[:150])
+                invalid += 1
+            else:
+                errors += 1  # شبكة/429 — يبقى ok ويُفحص لاحقاً
+        except Exception:  # noqa: BLE001
+            errors += 1
+        await asyncio.sleep(1)
 
-    text = "\n\n".join(lines)
-    if len(text) > 4000:
-        for chunk_start in range(0, len(text), 4000):
-            chunk = text[chunk_start:chunk_start + 4000]
-            await message.answer(chunk)
-    else:
-        await message.answer(text)
+    await status.edit_text(
+        "✅ <b>انتهت إعادة الفحص:</b>\n"
+        f"🟢 صالح: {ok}\n"
+        f"⛔ محظور: {banned}\n"
+        f"🔴 غير صالح/منخفض: {invalid}\n"
+        f"🌐 أخطاء شبكة (يبقى ok): {errors}\n\n"
+        "/pool لعرض المخزون."
+    )
